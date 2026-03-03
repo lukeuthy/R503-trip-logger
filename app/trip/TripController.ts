@@ -1,20 +1,21 @@
 import * as FileSystem from 'expo-file-system/legacy';
-import * as Location from 'expo-location';
 
 import { getDb } from '../database/db';
 import type { GPSPointRow } from '../models/GPSPoint';
 import type { StopEventRow } from '../models/StopEvent';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
 import { isSharingAvailable, tryShareFile } from '../utils/share';
-import { startGPSWatch, type GPSFix } from './gpsService';
-import { calculateSpeedMps } from './speedCalculator';
+import type { ActiveTripSession } from './activeTripStore';
+import { clearActiveTripSession, loadActiveTripSession, saveActiveTripSession } from './activeTripStore';
 import {
-  createInitialStopDetectorState,
-  evaluateStopDetection,
-  getStopDetectionConfig,
-  type StopDetectorState,
-  type StopInfo,
-} from './stopDetector';
+  ensureBackgroundLocationReady,
+  isBackgroundTrackingRunning,
+  setTripUpdateListener,
+  startBackgroundTracking,
+  stopBackgroundTracking,
+  type BackgroundTripUpdate,
+} from './backgroundLocationTask';
+import { createInitialStopDetectorState, getStopDetectionConfig, type StopInfo } from './stopDetector';
 
 export interface UITripState {
   status: 'idle' | 'recording' | 'stopped';
@@ -72,10 +73,14 @@ class TripController {
   };
 
   private listeners = new Set<(state: UITripState) => void>();
-  private locationSub: Location.LocationSubscription | null = null;
   private stops: StopInfo[] = [];
-  private detectorState: StopDetectorState = createInitialStopDetectorState();
-  private processing: Promise<void> = Promise.resolve();
+
+  constructor() {
+    setTripUpdateListener((update) => {
+      this.handleBackgroundTripUpdate(update);
+    });
+    void this.bootstrap();
+  }
 
   subscribe(listener: (state: UITripState) => void): () => void {
     this.listeners.add(listener);
@@ -107,13 +112,11 @@ class TripController {
     }
 
     this.setState({ isBusy: true, lastError: null });
-    this.appendLog('Starting trip...');
+    this.appendLog('Starting trip with background tracking...');
 
     let tripIdForRollback: string | null = null;
 
     try {
-      await this.stopLocationWatch();
-
       const db = await getDb();
       const startedAtMs = Date.now();
       const tripId = createUuidV4();
@@ -126,7 +129,20 @@ class TripController {
         [tripId, startedAtMs, this.state.routeNumber, this.state.directionCode, this.state.windowCode, 'recording'],
       );
 
-      this.detectorState = createInitialStopDetectorState();
+      const session: ActiveTripSession = {
+        tripId,
+        routeNumber: 'R503',
+        directionCode: this.state.directionCode,
+        windowCode: this.state.windowCode,
+        startedAtMs,
+        detectorState: createInitialStopDetectorState(),
+        lastFix: null,
+      };
+      await saveActiveTripSession(session);
+
+      await ensureBackgroundLocationReady();
+      await startBackgroundTracking();
+
       this.setState({
         status: 'recording',
         tripId,
@@ -143,20 +159,12 @@ class TripController {
         lastError: null,
       });
 
-      this.locationSub = await startGPSWatch((fix) => {
-        this.processing = this.processing
-          .then(() => this.persistFix(fix))
-          .catch((error: unknown) => {
-            const message = getErrorMessage(error);
-            this.setState({ lastError: message });
-            this.appendLog(`GPS processing error: ${message}`);
-          });
-      });
-
       const shareAvailable = await isSharingAvailable();
       this.setState({ shareAvailable, isBusy: false });
       this.appendLog(`Trip started: ${tripId}`);
     } catch (error) {
+      await this.safeBackgroundCleanup();
+
       if (tripIdForRollback) {
         try {
           const db = await getDb();
@@ -193,8 +201,7 @@ class TripController {
     this.appendLog('Stopping trip...');
 
     try {
-      await this.stopLocationWatch();
-      await this.processing;
+      await stopBackgroundTracking();
 
       const db = await getDb();
       await db.runAsync('UPDATE trip SET ended_at_ms = ?, status = ? WHERE trip_id = ?;', [
@@ -202,6 +209,7 @@ class TripController {
         'stopped',
         this.state.tripId,
       ]);
+      await clearActiveTripSession();
 
       this.setState({
         status: 'stopped',
@@ -320,84 +328,82 @@ class TripController {
     }
   }
 
-  private async persistFix(fix: GPSFix): Promise<void> {
-    const tripId = this.state.tripId;
-    if (!tripId) {
+  private async bootstrap(): Promise<void> {
+    try {
+      const shareAvailable = await isSharingAvailable();
+      this.setState({ shareAvailable });
+    } catch {
+      // Best effort only.
+    }
+
+    await this.recoverActiveTrip();
+  }
+
+  private async recoverActiveTrip(): Promise<void> {
+    try {
+      const session = await loadActiveTripSession();
+      if (!session) {
+        return;
+      }
+
+      const db = await getDb();
+      const trip = await db.getFirstAsync<TripRow>('SELECT * FROM trip WHERE trip_id = ?;', [session.tripId]);
+      if (!trip || trip.status !== 'recording') {
+        await this.safeBackgroundCleanup();
+        return;
+      }
+
+      this.stops = await this.loadStops(session.directionCode);
+      const snapshot = await this.loadTripSnapshot(session.tripId);
+
+      this.setState({
+        status: 'recording',
+        tripId: session.tripId,
+        directionCode: session.directionCode,
+        windowCode: session.windowCode,
+        pointsCount: snapshot.pointsCount,
+        eventsCount: snapshot.eventsCount,
+        lastFix: snapshot.lastFix,
+        nearestStopName: null,
+        nearestStopDistanceM: null,
+        insideStopName: null,
+        insideState: 'OUTSIDE',
+      });
+
+      const running = await isBackgroundTrackingRunning();
+      if (!running) {
+        await startBackgroundTracking();
+        this.appendLog('Recovered trip and restarted background tracking.');
+      } else {
+        this.appendLog('Recovered active trip after app restart.');
+      }
+    } catch (error) {
+      this.appendLog(`Recovery warning: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private handleBackgroundTripUpdate(update: BackgroundTripUpdate): void {
+    if (!this.state.tripId || update.tripId !== this.state.tripId) {
       return;
     }
 
-    const previous = this.state.lastFix
-      ? {
-          lat: this.state.lastFix.lat,
-          lon: this.state.lastFix.lon,
-          timestampMs: this.state.lastFix.timestampMs,
-        }
-      : null;
-    const computedSpeed = calculateSpeedMps(
-      previous,
-      { lat: fix.latitude, lon: fix.longitude, timestampMs: fix.timestampMs },
-      fix.speedMps,
-    );
-
-    const db = await getDb();
-
-    try {
-      await db.runAsync(
-        `INSERT INTO gps_point (trip_id, timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg)
-         VALUES (?, ?, ?, ?, ?, ?, ?);`,
-        [tripId, fix.timestampMs, fix.latitude, fix.longitude, fix.accuracyM, computedSpeed, fix.headingDeg],
-      );
-    } catch (error) {
-      throw new Error(`GPS insert failed: ${getErrorMessage(error)}`);
-    }
-
-    const detection = evaluateStopDetection(this.detectorState, this.stops, {
-      lat: fix.latitude,
-      lon: fix.longitude,
-      timestampMs: fix.timestampMs,
-    });
-    this.detectorState = detection.nextState;
-
-    let insertedEvents = 0;
-    for (const event of detection.events) {
-      try {
-        await db.runAsync(
-          `INSERT INTO stop_event (trip_id, stop_id, event_type, timestamp_ms, dist_m, lat, lon)
-           VALUES (?, ?, ?, ?, ?, ?, ?);`,
-          [tripId, event.stop_id, event.event_type, event.timestamp_ms, event.dist_m, event.lat, event.lon],
-        );
-        insertedEvents += 1;
-      } catch (error) {
-        this.setState({ lastError: `Stop event insert failed: ${getErrorMessage(error)}` });
-      }
-    }
-
     this.setState({
+      pointsCount: this.state.pointsCount + update.pointsInserted,
+      eventsCount: this.state.eventsCount + update.eventsInserted,
       lastFix: {
-        timestampMs: fix.timestampMs,
-        timestampIso: new Date(fix.timestampMs).toISOString(),
-        lat: fix.latitude,
-        lon: fix.longitude,
-        accuracyM: fix.accuracyM,
-        speedMps: computedSpeed,
-        headingDeg: fix.headingDeg,
+        timestampMs: update.lastFix.timestampMs,
+        timestampIso: new Date(update.lastFix.timestampMs).toISOString(),
+        lat: update.lastFix.lat,
+        lon: update.lastFix.lon,
+        accuracyM: update.lastFix.accuracyM,
+        speedMps: update.lastFix.speedMps,
+        headingDeg: update.lastFix.headingDeg,
       },
-      nearestStopName: detection.nearestStop?.stop_name ?? null,
-      nearestStopDistanceM: detection.nearestDistanceM,
-      insideStopName: detection.insideStop?.stop_name ?? null,
-      insideState: detection.insideState,
-      pointsCount: this.state.pointsCount + 1,
-      eventsCount: this.state.eventsCount + insertedEvents,
+      nearestStopName: update.nearestStopName,
+      nearestStopDistanceM: update.nearestStopDistanceM,
+      insideStopName: update.insideStopName,
+      insideState: update.insideState,
     });
-  }
-
-  private async stopLocationWatch(): Promise<void> {
-    try {
-      this.locationSub?.remove();
-    } catch {
-      // Remove can throw if the native subscription is already disposed.
-    }
-    this.locationSub = null;
   }
 
   private async loadStops(directionCode: DirectionCode): Promise<StopInfo[]> {
@@ -415,6 +421,60 @@ class TripController {
     return db.getAllAsync<StopInfo>(
       'SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code FROM stop ORDER BY stop_sequence ASC;',
     );
+  }
+
+  private async loadTripSnapshot(tripId: string): Promise<{
+    pointsCount: number;
+    eventsCount: number;
+    lastFix: UITripState['lastFix'];
+  }> {
+    const db = await getDb();
+
+    const pointsRow = await db.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) as count FROM gps_point WHERE trip_id = ?;',
+      [tripId],
+    );
+    const eventsRow = await db.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) as count FROM stop_event WHERE trip_id = ?;',
+      [tripId],
+    );
+    const latestRow = await db.getFirstAsync<{
+      timestamp_ms: number;
+      lat: number;
+      lon: number;
+      accuracy_m: number | null;
+      speed_mps: number | null;
+      heading_deg: number | null;
+    }>('SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1;', [tripId]);
+
+    return {
+      pointsCount: pointsRow?.count ?? 0,
+      eventsCount: eventsRow?.count ?? 0,
+      lastFix: latestRow
+        ? {
+            timestampMs: latestRow.timestamp_ms,
+            timestampIso: new Date(latestRow.timestamp_ms).toISOString(),
+            lat: latestRow.lat,
+            lon: latestRow.lon,
+            accuracyM: latestRow.accuracy_m,
+            speedMps: latestRow.speed_mps,
+            headingDeg: latestRow.heading_deg,
+          }
+        : null,
+    };
+  }
+
+  private async safeBackgroundCleanup(): Promise<void> {
+    try {
+      await stopBackgroundTracking();
+    } catch {
+      // Best effort only.
+    }
+    try {
+      await clearActiveTripSession();
+    } catch {
+      // Best effort only.
+    }
   }
 
   private appendLog(message: string): void {

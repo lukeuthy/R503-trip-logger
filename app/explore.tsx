@@ -53,7 +53,7 @@ export default function Explore() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>R503 Logger (Testing) v0.1</Text>
+        <Text style={styles.title}>R503 Logger (Testing) v0.2</Text>
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Route</Text>
