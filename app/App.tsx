@@ -1,5 +1,5 @@
-import Explore from './explore';
+import { AppTabs } from './src/screens/AppTabs';
 
 export default function App() {
-  return <Explore />;
+  return <AppTabs />;
 }

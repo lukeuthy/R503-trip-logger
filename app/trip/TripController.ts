@@ -4,6 +4,11 @@ import { getDb } from '../database/db';
 import type { GPSPointRow } from '../models/GPSPoint';
 import type { StopEventRow } from '../models/StopEvent';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
+import { exportTripBundle } from '../src/services/export/exportBundle';
+import { haversineMeters } from '../src/services/location/filters';
+import { createInitialStopDetectionState } from '../src/services/location/stopDetector';
+import { createUuidV4 } from '../src/utils/id';
+import { loadSettings, saveSettings } from '../src/utils/settingsStore';
 import { isSharingAvailable, tryShareFile } from '../utils/share';
 import type { ActiveTripSession } from './activeTripStore';
 import { clearActiveTripSession, loadActiveTripSession, saveActiveTripSession } from './activeTripStore';
@@ -16,6 +21,10 @@ import {
   type BackgroundTripUpdate,
 } from './backgroundLocationTask';
 import { createInitialStopDetectorState, getStopDetectionConfig, type StopInfo } from './stopDetector';
+import { insertSessionMetadata, loadTripDebug, markSessionEnded, resolveVariantId } from '../src/db/queries';
+
+const APP_VERSION = '1.0.0-v1.0';
+const MAX_LOG_LINES = 40;
 
 export interface UITripState {
   status: 'idle' | 'recording' | 'stopped';
@@ -26,6 +35,13 @@ export interface UITripState {
   tripId: string | null;
   pointsCount: number;
   eventsCount: number;
+  segmentsCount: number;
+  startedAtMs: number | null;
+  elapsedSeconds: number;
+  totalDistanceM: number;
+  avgSpeedMps: number | null;
+  currentSpeedMps: number | null;
+  gpsAccuracyM: number | null;
   lastFix: {
     timestampMs: number;
     timestampIso: string;
@@ -38,16 +54,18 @@ export interface UITripState {
   nearestStopName: string | null;
   nearestStopDistanceM: number | null;
   insideStopName: string | null;
+  expectedNextStopName: string | null;
   insideState: 'INSIDE' | 'OUTSIDE';
   exportPath: string | null;
   lastExportTimestampIso: string | null;
   shareAvailable: boolean | null;
   shareHint: string | null;
+  chartsMode: boolean;
+  debugOverlayEnabled: boolean;
+  lastFilterReason: string | null;
   lastError: string | null;
   logs: string[];
 }
-
-const MAX_LOG_LINES = 30;
 
 class TripController {
   private state: UITripState = {
@@ -59,21 +77,33 @@ class TripController {
     tripId: null,
     pointsCount: 0,
     eventsCount: 0,
+    segmentsCount: 0,
+    startedAtMs: null,
+    elapsedSeconds: 0,
+    totalDistanceM: 0,
+    avgSpeedMps: null,
+    currentSpeedMps: null,
+    gpsAccuracyM: null,
     lastFix: null,
     nearestStopName: null,
     nearestStopDistanceM: null,
     insideStopName: null,
+    expectedNextStopName: null,
     insideState: 'OUTSIDE',
     exportPath: null,
     lastExportTimestampIso: null,
     shareAvailable: null,
     shareHint: null,
+    chartsMode: true,
+    debugOverlayEnabled: false,
+    lastFilterReason: null,
     lastError: null,
     logs: [],
   };
 
   private listeners = new Set<(state: UITripState) => void>();
   private stops: StopInfo[] = [];
+  private elapsedTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     setTripUpdateListener((update) => {
@@ -90,6 +120,16 @@ class TripController {
 
   getState(): UITripState {
     return this.state;
+  }
+
+  async setDebugOverlayEnabled(enabled: boolean): Promise<void> {
+    await saveSettings({ debugOverlayEnabled: enabled });
+    this.setState({ debugOverlayEnabled: enabled });
+  }
+
+  async setChartsMode(chartsMode: boolean): Promise<void> {
+    await saveSettings({ chartsMode });
+    this.setState({ chartsMode });
   }
 
   setDirectionCode(directionCode: DirectionCode): void {
@@ -112,7 +152,7 @@ class TripController {
     }
 
     this.setState({ isBusy: true, lastError: null });
-    this.appendLog('Starting trip with background tracking...');
+    this.appendLog('Starting v1.0 trip session...');
 
     let tripIdForRollback: string | null = null;
 
@@ -129,13 +169,24 @@ class TripController {
         [tripId, startedAtMs, this.state.routeNumber, this.state.directionCode, this.state.windowCode, 'recording'],
       );
 
+      await insertSessionMetadata({
+        tripId,
+        directionCode: this.state.directionCode,
+        windowCode: this.state.windowCode,
+        appVersion: APP_VERSION,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        startTimestampMs: startedAtMs,
+      });
+
       const session: ActiveTripSession = {
         tripId,
         routeNumber: 'R503',
         directionCode: this.state.directionCode,
         windowCode: this.state.windowCode,
         startedAtMs,
+        variantId: resolveVariantId(this.state.directionCode, this.state.windowCode),
         detectorState: createInitialStopDetectorState(),
+        v1StopState: createInitialStopDetectionState(),
         lastFix: null,
       };
       await saveActiveTripSession(session);
@@ -146,19 +197,29 @@ class TripController {
       this.setState({
         status: 'recording',
         tripId,
+        startedAtMs,
+        elapsedSeconds: 0,
+        totalDistanceM: 0,
+        avgSpeedMps: null,
+        currentSpeedMps: null,
+        gpsAccuracyM: null,
         pointsCount: 0,
         eventsCount: 0,
+        segmentsCount: 0,
         lastFix: null,
         nearestStopName: null,
         nearestStopDistanceM: null,
         insideStopName: null,
+        expectedNextStopName: null,
         insideState: 'OUTSIDE',
         exportPath: null,
         lastExportTimestampIso: null,
         shareHint: null,
+        lastFilterReason: null,
         lastError: null,
       });
 
+      this.startElapsedTimer();
       const shareAvailable = await isSharingAvailable();
       this.setState({ shareAvailable, isBusy: false });
       this.appendLog(`Trip started: ${tripId}`);
@@ -168,20 +229,23 @@ class TripController {
       if (tripIdForRollback) {
         try {
           const db = await getDb();
-          await db.runAsync(
-            'UPDATE trip SET ended_at_ms = ?, status = ? WHERE trip_id = ?;',
-            [Date.now(), 'start_failed', tripIdForRollback],
-          );
+          await db.runAsync('UPDATE trip SET ended_at_ms = ?, status = ? WHERE trip_id = ?;', [
+            Date.now(),
+            'start_failed',
+            tripIdForRollback,
+          ]);
         } catch {
-          // Keep the primary failure surfaced to UI.
+          // Keep primary failure surfaced.
         }
       }
 
       const message = getErrorMessage(error);
+      this.stopElapsedTimer();
       this.setState({
         status: 'idle',
         isBusy: false,
         tripId: null,
+        startedAtMs: null,
         lastError: message,
       });
       this.appendLog(`Start failed: ${message}`);
@@ -204,13 +268,16 @@ class TripController {
       await stopBackgroundTracking();
 
       const db = await getDb();
+      const endedAtMs = Date.now();
       await db.runAsync('UPDATE trip SET ended_at_ms = ?, status = ? WHERE trip_id = ?;', [
-        Date.now(),
+        endedAtMs,
         'stopped',
         this.state.tripId,
       ]);
+      await markSessionEnded(this.state.tripId, endedAtMs);
       await clearActiveTripSession();
 
+      this.stopElapsedTimer();
       this.setState({
         status: 'stopped',
         isBusy: false,
@@ -259,7 +326,6 @@ class TripController {
         stops,
         config: {
           route_number: 'R503',
-          watch_interval_ms: 1000,
           ...getStopDetectionConfig(),
         },
       };
@@ -278,9 +344,7 @@ class TripController {
         exportPath: outputPath,
         lastExportTimestampIso: new Date().toISOString(),
         shareAvailable,
-        shareHint: shareAvailable
-          ? null
-          : 'Sharing is unavailable in this runtime. Copy the JSON via USB from app storage.',
+        shareHint: shareAvailable ? null : 'Sharing unavailable in this runtime.',
         isBusy: false,
       });
       this.appendLog(`Export complete: ${outputPath}`);
@@ -291,20 +355,43 @@ class TripController {
     }
   }
 
+  async exportBundle(): Promise<void> {
+    if (!this.state.tripId || this.state.isBusy) {
+      return;
+    }
+
+    this.setState({ isBusy: true, lastError: null });
+    this.appendLog('Building CSV/JSON export bundle...');
+    try {
+      const result = await exportTripBundle(this.state.tripId);
+      this.setState({
+        exportPath: result.sharePath,
+        lastExportTimestampIso: new Date().toISOString(),
+        shareAvailable: true,
+        shareHint: null,
+        isBusy: false,
+      });
+      this.appendLog(`Bundle ready: ${result.sharePath}`);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      this.setState({ isBusy: false, lastError: message });
+      this.appendLog(`Bundle export failed: ${message}`);
+    }
+  }
+
   async shareExport(): Promise<void> {
     if (!this.state.exportPath || this.state.isBusy) {
       return;
     }
 
     this.setState({ isBusy: true, lastError: null });
-
     try {
       const available = await isSharingAvailable();
       if (!available) {
         this.setState({
           isBusy: false,
           shareAvailable: false,
-          shareHint: 'Sharing is unavailable. Copy exported JSON via USB.',
+          shareHint: 'Sharing unavailable. Export by adb pull/debug workflow.',
         });
         return;
       }
@@ -314,7 +401,7 @@ class TripController {
         this.setState({
           isBusy: false,
           shareAvailable: false,
-          shareHint: 'Sharing failed in this environment. Copy exported JSON via USB.',
+          shareHint: 'Sharing failed in this environment.',
         });
         return;
       }
@@ -330,10 +417,15 @@ class TripController {
 
   private async bootstrap(): Promise<void> {
     try {
+      const settings = await loadSettings();
+      this.setState({
+        chartsMode: settings.chartsMode,
+        debugOverlayEnabled: settings.debugOverlayEnabled,
+      });
       const shareAvailable = await isSharingAvailable();
       this.setState({ shareAvailable });
     } catch {
-      // Best effort only.
+      // Best effort.
     }
 
     await this.recoverActiveTrip();
@@ -361,15 +453,23 @@ class TripController {
         tripId: session.tripId,
         directionCode: session.directionCode,
         windowCode: session.windowCode,
+        startedAtMs: trip.started_at_ms,
         pointsCount: snapshot.pointsCount,
         eventsCount: snapshot.eventsCount,
+        segmentsCount: snapshot.segmentsCount,
         lastFix: snapshot.lastFix,
+        totalDistanceM: snapshot.totalDistanceM,
+        avgSpeedMps: snapshot.avgSpeedMps,
+        currentSpeedMps: snapshot.lastFix?.speedMps ?? null,
+        gpsAccuracyM: snapshot.lastFix?.accuracyM ?? null,
         nearestStopName: null,
         nearestStopDistanceM: null,
         insideStopName: null,
+        expectedNextStopName: null,
         insideState: 'OUTSIDE',
       });
 
+      this.startElapsedTimer();
       const running = await isBackgroundTrackingRunning();
       if (!running) {
         await startBackgroundTracking();
@@ -382,14 +482,91 @@ class TripController {
     }
   }
 
+  private async loadTripSnapshot(tripId: string): Promise<{
+    pointsCount: number;
+    eventsCount: number;
+    segmentsCount: number;
+    totalDistanceM: number;
+    avgSpeedMps: number | null;
+    lastFix: UITripState['lastFix'];
+  }> {
+    const db = await getDb();
+
+    const pointsRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM gps_point WHERE trip_id = ?;', [tripId]);
+    const eventsRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM stop_event WHERE trip_id = ?;', [tripId]);
+    const segmentRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM segment_times WHERE trip_id = ?;', [tripId]);
+    const latestRow = await db.getFirstAsync<{
+      timestamp_ms: number;
+      lat: number;
+      lon: number;
+      accuracy_m: number | null;
+      speed_mps: number | null;
+      heading_deg: number | null;
+    }>(
+      'SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1;',
+      [tripId],
+    );
+    const firstRow = await db.getFirstAsync<{ timestamp_ms: number }>(
+      'SELECT timestamp_ms FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms ASC LIMIT 1;',
+      [tripId],
+    );
+
+    const pathRows = await db.getAllAsync<{ lat: number; lon: number }>(
+      'SELECT lat, lon FROM gps_point WHERE trip_id = ? AND is_filtered = 0 ORDER BY timestamp_ms ASC;',
+      [tripId],
+    );
+    let distance = 0;
+    for (let index = 1; index < pathRows.length; index += 1) {
+      const prev = pathRows[index - 1];
+      const curr = pathRows[index];
+      distance += haversineMeters(prev.lat, prev.lon, curr.lat, curr.lon);
+    }
+
+    const elapsedSec =
+      latestRow && firstRow ? Math.max(1, Math.round((latestRow.timestamp_ms - firstRow.timestamp_ms) / 1000)) : null;
+
+    return {
+      pointsCount: pointsRow?.count ?? 0,
+      eventsCount: eventsRow?.count ?? 0,
+      segmentsCount: segmentRow?.count ?? 0,
+      totalDistanceM: distance,
+      avgSpeedMps: elapsedSec ? distance / elapsedSec : null,
+      lastFix: latestRow
+        ? {
+            timestampMs: latestRow.timestamp_ms,
+            timestampIso: new Date(latestRow.timestamp_ms).toISOString(),
+            lat: latestRow.lat,
+            lon: latestRow.lon,
+            accuracyM: latestRow.accuracy_m,
+            speedMps: latestRow.speed_mps,
+            headingDeg: latestRow.heading_deg,
+          }
+        : null,
+    };
+  }
+
   private handleBackgroundTripUpdate(update: BackgroundTripUpdate): void {
     if (!this.state.tripId || update.tripId !== this.state.tripId) {
       return;
     }
 
+    const previousFix = this.state.lastFix;
+    const incrementDistance =
+      previousFix == null ? 0 : haversineMeters(previousFix.lat, previousFix.lon, update.lastFix.lat, update.lastFix.lon);
+    const totalDistanceM = this.state.totalDistanceM + incrementDistance;
+    const elapsedSeconds =
+      this.state.startedAtMs == null ? this.state.elapsedSeconds : Math.max(0, Math.floor((Date.now() - this.state.startedAtMs) / 1000));
+    const avgSpeedMps = elapsedSeconds > 0 ? totalDistanceM / elapsedSeconds : null;
+
     this.setState({
       pointsCount: this.state.pointsCount + update.pointsInserted,
       eventsCount: this.state.eventsCount + update.eventsInserted,
+      segmentsCount: this.state.segmentsCount + update.segmentUpdates,
+      elapsedSeconds,
+      totalDistanceM,
+      avgSpeedMps,
+      currentSpeedMps: update.lastFix.speedMps,
+      gpsAccuracyM: update.lastFix.accuracyM,
       lastFix: {
         timestampMs: update.lastFix.timestampMs,
         timestampIso: new Date(update.lastFix.timestampMs).toISOString(),
@@ -402,7 +579,9 @@ class TripController {
       nearestStopName: update.nearestStopName,
       nearestStopDistanceM: update.nearestStopDistanceM,
       insideStopName: update.insideStopName,
+      expectedNextStopName: update.expectedNextStopName,
       insideState: update.insideState,
+      lastFilterReason: update.lastFilterReason,
     });
   }
 
@@ -423,57 +602,35 @@ class TripController {
     );
   }
 
-  private async loadTripSnapshot(tripId: string): Promise<{
-    pointsCount: number;
-    eventsCount: number;
-    lastFix: UITripState['lastFix'];
-  }> {
-    const db = await getDb();
+  private startElapsedTimer(): void {
+    this.stopElapsedTimer();
+    this.elapsedTimer = setInterval(() => {
+      if (this.state.status !== 'recording' || this.state.startedAtMs == null) {
+        return;
+      }
+      const elapsedSeconds = Math.max(0, Math.floor((Date.now() - this.state.startedAtMs) / 1000));
+      const avgSpeedMps = elapsedSeconds > 0 ? this.state.totalDistanceM / elapsedSeconds : null;
+      this.setState({ elapsedSeconds, avgSpeedMps });
+    }, 1000);
+  }
 
-    const pointsRow = await db.getFirstAsync<{ count: number }>(
-      'SELECT COUNT(*) as count FROM gps_point WHERE trip_id = ?;',
-      [tripId],
-    );
-    const eventsRow = await db.getFirstAsync<{ count: number }>(
-      'SELECT COUNT(*) as count FROM stop_event WHERE trip_id = ?;',
-      [tripId],
-    );
-    const latestRow = await db.getFirstAsync<{
-      timestamp_ms: number;
-      lat: number;
-      lon: number;
-      accuracy_m: number | null;
-      speed_mps: number | null;
-      heading_deg: number | null;
-    }>('SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1;', [tripId]);
-
-    return {
-      pointsCount: pointsRow?.count ?? 0,
-      eventsCount: eventsRow?.count ?? 0,
-      lastFix: latestRow
-        ? {
-            timestampMs: latestRow.timestamp_ms,
-            timestampIso: new Date(latestRow.timestamp_ms).toISOString(),
-            lat: latestRow.lat,
-            lon: latestRow.lon,
-            accuracyM: latestRow.accuracy_m,
-            speedMps: latestRow.speed_mps,
-            headingDeg: latestRow.heading_deg,
-          }
-        : null,
-    };
+  private stopElapsedTimer(): void {
+    if (this.elapsedTimer) {
+      clearInterval(this.elapsedTimer);
+      this.elapsedTimer = null;
+    }
   }
 
   private async safeBackgroundCleanup(): Promise<void> {
     try {
       await stopBackgroundTracking();
     } catch {
-      // Best effort only.
+      // Best effort.
     }
     try {
       await clearActiveTripSession();
     } catch {
-      // Best effort only.
+      // Best effort.
     }
   }
 
@@ -494,6 +651,17 @@ class TripController {
       listener(this.state);
     }
   }
+
+  async refreshDebugInfo(): Promise<void> {
+    if (!this.state.tripId) {
+      return;
+    }
+    const debug = await loadTripDebug(this.state.tripId);
+    this.setState({
+      segmentsCount: debug.segmentsCount,
+      lastFilterReason: debug.lastFilterReason,
+    });
+  }
 }
 
 function getErrorMessage(error: unknown): string {
@@ -501,14 +669,6 @@ function getErrorMessage(error: unknown): string {
     return error.message;
   }
   return 'Unknown error';
-}
-
-function createUuidV4(): string {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (char) => {
-    const rand = Math.floor(Math.random() * 16);
-    const value = char === 'x' ? rand : (rand & 0x3) | 0x8;
-    return value.toString(16);
-  });
 }
 
 export const tripController = new TripController();
