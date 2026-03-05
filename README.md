@@ -1,58 +1,162 @@
-# R503 Logger (Testing) - v0.2
+# R503 Trip Logger - v1.0
 
-Offline-first Expo React Native + TypeScript app for real-world R503 trip logging.
+Offline-first Expo React Native app for collecting trip and stop-level bus travel data on route `R503` (thesis data collection for ETA modeling).
 
-## What v0.2 does
+## What v1.0 includes
 
-- Background GPS logging using `expo-location` + `expo-task-manager`.
-- Foreground service notification while tracking in Android background.
-- Auto-recovery of active trip after app restart.
-- Local SQLite storage using `expo-sqlite`:
-  - `trip`
-  - `gps_point`
-  - `stop`
-  - `stop_event`
-- Stop detection (nearest-stop + hysteresis + dwell):
-  - `ENTER` at `<= 35m`
-  - `DWELL_CONFIRMED` after `>= 10s` while still `<= 35m`
-  - `EXIT` at `>= 60m`
-- JSON export to `FileSystem.documentDirectory` using `expo-file-system`.
-- Share export through `expo-sharing` when available.
-- UI telemetry panel:
-  - trip status, point/event counters
-  - last GPS fix (lat/lon/accuracy/speed/heading)
-  - nearest stop + inside/outside state
-  - export result, errors, and recent logs
+- Android-first trip session logging with background location tracking.
+- Start/stop-only operator workflow (minimal manual input).
+- Auto-captured session metadata at trip start:
+  - `trip_id (run_id UUID)`
+  - `device_id` (persisted local UUID)
+  - route and variant metadata
+  - app version, timezone, OS/platform context
+  - time bucket (for AM/PM grouping)
+- Raw GPS + filtered/smoothed GPS storage for auditability.
+- Offline stop detection (sequence-aware geofence-style arrive/depart events).
+- Segment-time derivation between consecutive stops.
+- Dark glassmorphism dashboard UI with:
+  - visualization mode (mini charts)
+  - text/table mode
+  - debug overlay toggle
+- Export pipeline:
+  - `trip_sessions.csv`
+  - `gps_points.csv`
+  - `stop_events.csv`
+  - `segment_times.csv`
+  - `metadata.json`
+  - `bundle.json`
+  - `bundle.zip` (share-ready)
 
-## App identity
+## Data collection workflow
 
-- Display name: `R503 Logger (Testing)`
-- Android package: `com.jaja.r503logger.testing`
+1. Open app on phone.
+2. Go to `Trip` tab, choose direction/window.
+3. Tap `Start Trip`.
+4. App logs continuously in foreground/background (offline).
+5. Stop detection and segment derivation happen on-device.
+6. Tap `Stop Trip` at run end.
+7. Open `Export` tab and tap `Export Bundle (CSV/JSON/ZIP)`.
+8. Tap `Share Export` and send to Drive/Files/Gmail/etc.
 
-## Prerequisites
+## Repository file map
 
-- Node.js `>= 20.19.4`
-- Android phone (real device recommended)
-- USB debugging enabled
-- `adb` installed (`adb devices` should detect your phone)
+Root app: `app/`
 
-## Dev run (uses Metro)
+Core runtime and compatibility:
+- `app/trip/TripController.ts`
+- `app/trip/backgroundLocationTask.ts`
+- `app/trip/activeTripStore.ts`
+- `app/database/db.ts`
+- `app/database/migrations.ts`
+- `app/database/schema.ts`
+
+v1.0 data and logic modules:
+- `app/src/db/queries.ts`
+- `app/src/services/location/filters.ts`
+- `app/src/services/location/stopDetector.ts`
+- `app/src/services/location/segmentBuilder.ts`
+- `app/src/services/location/tracker.ts`
+- `app/src/services/export/exportBundle.ts`
+- `app/src/utils/settingsStore.ts`
+- `app/src/utils/id.ts`
+
+UI/theme:
+- `app/src/screens/AppTabs.tsx`
+- `app/src/screens/DashboardScreen.tsx`
+- `app/src/screens/TripScreen.tsx`
+- `app/src/screens/ExportsScreen.tsx`
+- `app/src/screens/SettingsScreen.tsx`
+- `app/src/components/GlassCard.tsx`
+- `app/src/components/MetricTile.tsx`
+- `app/src/components/MiniChart.tsx`
+- `app/src/components/StopProgress.tsx`
+- `app/src/theme/tokens.ts`
+
+Route seeds:
+- `app/data/r503_stops.ts`
+
+## SQLite schema (v1.0 additions)
+
+Added normalized tables (without dropping legacy tables):
+
+- `schema_meta`
+- `devices`
+- `routes`
+- `route_variants`
+- `stops`
+- `trip_sessions`
+- `gps_points`
+- `stop_events`
+- `segment_times`
+
+Legacy tables (`trip`, `gps_point`, `stop`, `stop_event`) are still preserved for backward compatibility.
+
+## Export sample rows
+
+`trip_sessions.csv`
+
+```csv
+trip_id,device_id,variant_id,started_at,ended_at,timezone,app_version,time_bucket,notes
+9f3...,4ba...,r503_am,2026-03-06T08:02:12.000Z,2026-03-06T08:47:29.000Z,Asia/Taipei,1.0.0-v1.0,08-09,
+```
+
+`gps_points.csv`
+
+```csv
+point_id,trip_id,ts,lat,lng,accuracy_m,speed_mps,is_filtered,filter_reason,smoothed_lat,smoothed_lng,smoothed_speed_mps
+2ab...,9f3...,2026-03-06T08:02:13.000Z,7.06094,125.55389,8.4,3.8,0,,7.06094,125.55389,3.8
+```
+
+`stop_events.csv`
+
+```csv
+event_id,trip_id,stop_id,event_type,ts,dist_to_stop_m,speed_mps,accuracy_m
+7ce...,9f3...,r503_r503_am_s01,arrive,2026-03-06T08:03:11.000Z,17.6,1.2,7.1
+```
+
+`segment_times.csv`
+
+```csv
+segment_id,trip_id,from_stop_id,to_stop_id,start_ts,end_ts,travel_time_sec,distance_m,avg_speed_mps,p95_speed_mps,mean_accuracy_m
+1f8...,9f3...,r503_r503_am_s01,r503_r503_am_s02,2026-03-06T08:03:45.000Z,2026-03-06T08:07:20.000Z,215,1340.1,6.2,10.5,9.8
+```
+
+## How exports are used for training + benchmarking
+
+1. Import exported CSV files to laptop (Python/R).
+2. Build feature sets by segment and time bucket:
+   - segment travel time target
+   - speed statistics
+   - accuracy quality metrics
+   - AM/PM and peak bucket flags
+3. Train ETA models offline (no app-side ML required).
+4. Benchmark with MAE/RMSE/MAPE by segment and time-of-day.
+5. Iterate route/stop detection parameters, recollect, retrain.
+
+## Run and verify locally
 
 ```bash
 cd app
 npm install
+npm run typecheck
 npx expo start
 ```
 
-Use this for development only.
+## Build APK (standalone, no Metro at runtime)
 
-## Standalone install on phone (no Metro at runtime)
+### EAS Build (recommended)
 
-For a standalone app that works without Metro, install a **release** build (not Expo Go and not a debug dev-client build).
+1. Install EAS CLI and configure:
 
-### Option A: EAS APK (recommended if you have EAS account/project)
+```bash
+npm install -g eas-cli
+cd app
+eas login
+eas build:configure
+```
 
-1. In `app`, create `eas.json` if missing:
+2. Ensure `eas.json` contains APK profile:
 
 ```json
 {
@@ -66,70 +170,27 @@ For a standalone app that works without Metro, install a **release** build (not 
 }
 ```
 
-2. Build:
+3. Build:
 
 ```bash
 cd app
-npx eas login
-npx eas build -p android --profile preview
+eas build -p android --profile preview
 ```
 
-3. Download the APK from the EAS build page and install on phone.
+4. Download APK from EAS build page and install on phone.
 
-### Option B: Local release APK (no EAS cloud build)
+### Local APK build (Windows)
 
-```bash
+```powershell
 cd app
 npx expo prebuild --clean
 cd android
 .\gradlew.bat assembleRelease
+adb install -r app\build\outputs\apk\release\app-release.apk
 ```
 
-APK output:
+## Notes and constraints
 
-- `app/android/app/build/outputs/apk/release/app-release.apk`
-
-Install:
-
-```bash
-adb install -r app-release.apk
-```
-
-If there is a package conflict:
-
-```bash
-adb uninstall com.jaja.r503logger.testing
-adb install app-release.apk
-```
-
-## Field workflow
-
-1. Open app.
-2. Choose `Direction` (`A` or `B`) and `Service Window` (`AM`, `PM`, `OFF`).
-3. Tap `Start Trip`.
-4. Keep GPS enabled; app can continue recording in background in v0.2.
-5. At trip end, tap `Stop Trip`.
-6. Tap `Export JSON`.
-7. Tap `Share Export` and send to Drive/Gmail/Messenger/etc.
-
-Export filename format:
-- `r503_trip_<trip_id>.json`
-
-## Important Android settings for reliable background logging
-
-- Grant:
-  - Foreground location
-  - Background location (`Allow all the time`)
-- Exclude app from battery optimization if your phone kills background services aggressively.
-- Keep location services on.
-
-## Troubleshooting
-
-- `Background location permission denied`:
-  - In Android settings, set app location to `Allow all the time`.
-- Tracking stops when app is swiped away:
-  - Disable battery optimization for this app.
-- `Share Export` not shown:
-  - Reinstall standalone build (Expo Go can behave differently for sharing).
-- Low/unstable GPS accuracy:
-  - Move to open sky and wait for accuracy to settle before trip start.
+- No cloud sync/login/server is used.
+- All critical logging and stop detection runs offline.
+- Grant background location permission and disable aggressive battery optimization for best field reliability.
