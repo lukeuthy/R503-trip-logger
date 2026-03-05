@@ -2,12 +2,17 @@ import * as FileSystem from 'expo-file-system/legacy';
 
 import type { DirectionCode, WindowCode } from '../models/Trip';
 import type { StopDetectorState } from './stopDetector';
+import type { StopDetectionState } from '../src/services/location/stopDetector';
 
 export interface PersistedFix {
   timestampMs: number;
   lat: number;
   lon: number;
+  accuracyM?: number | null;
   speedMps: number | null;
+  smoothedLat?: number | null;
+  smoothedLon?: number | null;
+  smoothedSpeedMps?: number | null;
 }
 
 export interface ActiveTripSession {
@@ -17,6 +22,8 @@ export interface ActiveTripSession {
   windowCode: WindowCode;
   startedAtMs: number;
   detectorState: StopDetectorState;
+  v1StopState?: StopDetectionState;
+  variantId?: string;
   lastFix: PersistedFix | null;
 }
 

@@ -42,3 +42,102 @@ export const CREATE_SCHEMA_STATEMENTS: string[] = [
   );`,
   `CREATE INDEX IF NOT EXISTS idx_stop_event_trip_ts ON stop_event(trip_id, timestamp_ms);`,
 ];
+
+export const CREATE_V1_TABLE_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS schema_meta (
+    schema_version INTEGER NOT NULL,
+    installed_at TEXT NOT NULL
+  );`,
+  `CREATE TABLE IF NOT EXISTS devices (
+    device_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    os_version TEXT NOT NULL,
+    model TEXT NOT NULL
+  );`,
+  `CREATE TABLE IF NOT EXISTS routes (
+    route_id TEXT PRIMARY KEY,
+    route_number TEXT NOT NULL,
+    name TEXT NOT NULL
+  );`,
+  `CREATE TABLE IF NOT EXISTS route_variants (
+    variant_id TEXT PRIMARY KEY,
+    route_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    time_period TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    FOREIGN KEY(route_id) REFERENCES routes(route_id)
+  );`,
+  `CREATE TABLE IF NOT EXISTS stops (
+    stop_id TEXT PRIMARY KEY,
+    variant_id TEXT NOT NULL,
+    stop_order INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    lat REAL NOT NULL,
+    lng REAL NOT NULL,
+    radius_m REAL NOT NULL,
+    FOREIGN KEY(variant_id) REFERENCES route_variants(variant_id)
+  );`,
+  `CREATE TABLE IF NOT EXISTS trip_sessions (
+    trip_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    variant_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    timezone TEXT NOT NULL,
+    app_version TEXT NOT NULL,
+    time_bucket TEXT NOT NULL,
+    notes TEXT,
+    FOREIGN KEY(device_id) REFERENCES devices(device_id),
+    FOREIGN KEY(variant_id) REFERENCES route_variants(variant_id)
+  );`,
+  `CREATE TABLE IF NOT EXISTS gps_points (
+    point_id TEXT PRIMARY KEY,
+    trip_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    lat REAL NOT NULL,
+    lng REAL NOT NULL,
+    accuracy_m REAL,
+    altitude_m REAL,
+    speed_mps REAL,
+    bearing_deg REAL,
+    is_filtered INTEGER NOT NULL DEFAULT 0,
+    filter_reason TEXT,
+    smoothed_lat REAL,
+    smoothed_lng REAL,
+    smoothed_speed_mps REAL,
+    FOREIGN KEY(trip_id) REFERENCES trip_sessions(trip_id)
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_gps_points_trip_ts ON gps_points(trip_id, ts);`,
+  `CREATE TABLE IF NOT EXISTS stop_events (
+    event_id TEXT PRIMARY KEY,
+    trip_id TEXT NOT NULL,
+    stop_id TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('arrive', 'depart')),
+    ts TEXT NOT NULL,
+    dist_to_stop_m REAL NOT NULL,
+    speed_mps REAL,
+    accuracy_m REAL,
+    FOREIGN KEY(trip_id) REFERENCES trip_sessions(trip_id),
+    FOREIGN KEY(stop_id) REFERENCES stops(stop_id)
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_stop_events_trip_ts ON stop_events(trip_id, ts);`,
+  `CREATE TABLE IF NOT EXISTS segment_times (
+    segment_id TEXT PRIMARY KEY,
+    trip_id TEXT NOT NULL,
+    from_stop_id TEXT NOT NULL,
+    to_stop_id TEXT NOT NULL,
+    start_ts TEXT NOT NULL,
+    end_ts TEXT NOT NULL,
+    travel_time_sec INTEGER NOT NULL,
+    distance_m REAL NOT NULL,
+    avg_speed_mps REAL,
+    p95_speed_mps REAL,
+    mean_accuracy_m REAL,
+    FOREIGN KEY(trip_id) REFERENCES trip_sessions(trip_id),
+    FOREIGN KEY(from_stop_id) REFERENCES stops(stop_id),
+    FOREIGN KEY(to_stop_id) REFERENCES stops(stop_id)
+  );`,
+  `CREATE INDEX IF NOT EXISTS idx_segment_times_trip ON segment_times(trip_id);`,
+];

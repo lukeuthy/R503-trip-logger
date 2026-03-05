@@ -3,6 +3,21 @@ import * as TaskManager from 'expo-task-manager';
 
 import { getDb } from '../database/db';
 import type { DirectionCode } from '../models/Trip';
+import {
+  loadStopsForVariant,
+  persistPoint,
+  persistStopEvent,
+  rebuildSegmentsForTrip,
+  resolveVariantId,
+} from '../src/db/queries';
+import { applyEmaSmoothing, filterRawPoint } from '../src/services/location/filters';
+import {
+  createInitialStopDetectionState,
+  DEFAULT_STOP_CONFIG,
+  evaluateSequencedStopDetection,
+  type RouteStop,
+} from '../src/services/location/stopDetector';
+import { loadSettings } from '../src/utils/settingsStore';
 import { calculateSpeedMps } from './speedCalculator';
 import type { ActiveTripSession, PersistedFix } from './activeTripStore';
 import { loadActiveTripSession, saveActiveTripSession } from './activeTripStore';
@@ -14,6 +29,7 @@ export interface BackgroundTripUpdate {
   tripId: string;
   pointsInserted: number;
   eventsInserted: number;
+  segmentUpdates: number;
   lastFix: {
     timestampMs: number;
     lat: number;
@@ -26,6 +42,8 @@ export interface BackgroundTripUpdate {
   nearestStopDistanceM: number | null;
   insideStopName: string | null;
   insideState: 'INSIDE' | 'OUTSIDE';
+  lastFilterReason: string | null;
+  expectedNextStopName: string | null;
 }
 
 type TripUpdateListener = (update: BackgroundTripUpdate) => void;
@@ -64,9 +82,9 @@ export async function startBackgroundTracking(): Promise<void> {
   }
 
   await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, {
-    accuracy: Location.Accuracy.High,
-    timeInterval: 1000,
-    distanceInterval: 0,
+    accuracy: Location.Accuracy.Balanced,
+    timeInterval: 2000,
+    distanceInterval: 5,
     pausesUpdatesAutomatically: false,
     foregroundService: {
       notificationTitle: 'R503 logger running',
@@ -85,9 +103,7 @@ export async function stopBackgroundTracking(): Promise<void> {
 }
 
 if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
-  TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{
-    locations?: Location.LocationObject[];
-  }>) => {
+  TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{ locations?: Location.LocationObject[] }>) => {
     const { data, error } = taskBody;
     if (error) {
       return;
@@ -103,27 +119,38 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
       return;
     }
 
-    const stops = await loadStopsForDirection(session.directionCode);
+    const legacyStops = await loadLegacyStopsForDirection(session.directionCode);
+    const variantId = session.variantId ?? resolveVariantId(session.directionCode, session.windowCode);
+    const v1Stops = await loadStopsForVariant(variantId);
 
     let pointsInserted = 0;
     let eventsInserted = 0;
+    let segmentUpdates = 0;
     let lastUpdate: BackgroundTripUpdate | null = null;
-    let mutableSession: ActiveTripSession = session;
+    let mutableSession: ActiveTripSession = {
+      ...session,
+      variantId,
+      v1StopState: session.v1StopState ?? createInitialStopDetectionState(),
+    };
 
     for (const position of locations) {
-      const result = await persistLocationForSession(mutableSession, stops, position);
+      const result = await persistLocationForSession(mutableSession, legacyStops, v1Stops, position);
       mutableSession = result.session;
       pointsInserted += result.pointsInserted;
       eventsInserted += result.eventsInserted;
+      segmentUpdates += result.segmentUpdates;
       lastUpdate = {
         tripId: mutableSession.tripId,
         pointsInserted,
         eventsInserted,
+        segmentUpdates,
         lastFix: result.lastFix,
         nearestStopName: result.nearestStopName,
         nearestStopDistanceM: result.nearestStopDistanceM,
         insideStopName: result.insideStopName,
         insideState: result.insideState,
+        lastFilterReason: result.lastFilterReason,
+        expectedNextStopName: result.expectedNextStopName,
       };
     }
 
@@ -134,7 +161,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
   });
 }
 
-async function loadStopsForDirection(directionCode: DirectionCode): Promise<StopInfo[]> {
+async function loadLegacyStopsForDirection(directionCode: DirectionCode): Promise<StopInfo[]> {
   const db = await getDb();
   const filtered = await db.getAllAsync<StopInfo>(
     `SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code
@@ -153,12 +180,14 @@ async function loadStopsForDirection(directionCode: DirectionCode): Promise<Stop
 
 async function persistLocationForSession(
   session: ActiveTripSession,
-  stops: StopInfo[],
+  legacyStops: StopInfo[],
+  v1Stops: RouteStop[],
   position: Location.LocationObject,
 ): Promise<{
   session: ActiveTripSession;
   pointsInserted: number;
   eventsInserted: number;
+  segmentUpdates: number;
   lastFix: {
     timestampMs: number;
     lat: number;
@@ -171,6 +200,8 @@ async function persistLocationForSession(
   nearestStopDistanceM: number | null;
   insideStopName: string | null;
   insideState: 'INSIDE' | 'OUTSIDE';
+  lastFilterReason: string | null;
+  expectedNextStopName: string | null;
 }> {
   const db = await getDb();
   const coords = position.coords;
@@ -181,6 +212,7 @@ async function persistLocationForSession(
         timestampMs: session.lastFix.timestampMs,
       }
     : null;
+
   const computedSpeed = calculateSpeedMps(
     previous,
     {
@@ -191,9 +223,45 @@ async function persistLocationForSession(
     coords.speed ?? null,
   );
 
+  const rawPoint = {
+    timestampMs: position.timestamp,
+    lat: coords.latitude,
+    lon: coords.longitude,
+    accuracyM: coords.accuracy ?? null,
+    speedMps: computedSpeed,
+  };
+  const filter = filterRawPoint(
+    session.lastFix
+      ? {
+          timestampMs: session.lastFix.timestampMs,
+          lat: session.lastFix.lat,
+          lon: session.lastFix.lon,
+          accuracyM: session.lastFix.accuracyM ?? null,
+          speedMps: session.lastFix.speedMps,
+        }
+      : null,
+    rawPoint,
+  );
+  const settings = await loadSettings();
+  const smoothed = applyEmaSmoothing(
+    session.lastFix
+      ? {
+          lat: session.lastFix.smoothedLat ?? session.lastFix.lat,
+          lon: session.lastFix.smoothedLon ?? session.lastFix.lon,
+          speedMps: session.lastFix.smoothedSpeedMps ?? session.lastFix.speedMps,
+        }
+      : null,
+    {
+      lat: rawPoint.lat,
+      lon: rawPoint.lon,
+      speedMps: rawPoint.speedMps,
+    },
+    settings.smoothingAlpha,
+  );
+
   await db.runAsync(
-    `INSERT INTO gps_point (trip_id, timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg)
-     VALUES (?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO gps_point (trip_id, timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg, is_filtered, filter_reason, smoothed_lat, smoothed_lon, smoothed_speed_mps)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
       session.tripId,
       position.timestamp,
@@ -202,23 +270,81 @@ async function persistLocationForSession(
       coords.accuracy ?? null,
       computedSpeed,
       coords.heading ?? null,
+      filter.isFiltered ? 1 : 0,
+      filter.reason,
+      smoothed.lat,
+      smoothed.lon,
+      smoothed.speedMps,
     ],
   );
 
-  const detection = evaluateStopDetection(session.detectorState, stops, {
+  await persistPoint({
+    tripId: session.tripId,
+    timestampMs: position.timestamp,
+    lat: coords.latitude,
+    lon: coords.longitude,
+    accuracyM: coords.accuracy ?? null,
+    altitudeM: coords.altitude ?? null,
+    speedMps: computedSpeed,
+    headingDeg: coords.heading ?? null,
+    isFiltered: filter.isFiltered,
+    filterReason: filter.reason,
+    smoothedLat: smoothed.lat,
+    smoothedLng: smoothed.lon,
+    smoothedSpeedMps: smoothed.speedMps,
+  });
+
+  const legacyDetection = evaluateStopDetection(session.detectorState, legacyStops, {
     lat: coords.latitude,
     lon: coords.longitude,
     timestampMs: position.timestamp,
   });
 
+  const v1Detection = evaluateSequencedStopDetection(
+    session.v1StopState ?? createInitialStopDetectionState(),
+    v1Stops,
+    {
+      timestampMs: position.timestamp,
+      lat: filter.isFiltered ? smoothed.lat : coords.latitude,
+      lon: filter.isFiltered ? smoothed.lon : coords.longitude,
+      speedMps: computedSpeed,
+      accuracyM: coords.accuracy ?? null,
+    },
+    {
+      ...DEFAULT_STOP_CONFIG,
+      enterRadiusM: settings.enterRadiusM,
+      exitRadiusM: settings.exitRadiusM,
+    },
+  );
+
   let insertedEvents = 0;
-  for (const event of detection.events) {
+  let segmentUpdates = 0;
+
+  for (const event of legacyDetection.events) {
     await db.runAsync(
       `INSERT INTO stop_event (trip_id, stop_id, event_type, timestamp_ms, dist_m, lat, lon)
        VALUES (?, ?, ?, ?, ?, ?, ?);`,
       [session.tripId, event.stop_id, event.event_type, event.timestamp_ms, event.dist_m, event.lat, event.lon],
     );
     insertedEvents += 1;
+  }
+
+  for (const event of v1Detection.events) {
+    await persistStopEvent({
+      tripId: session.tripId,
+      stopId: event.stopId,
+      eventType: event.eventType,
+      timestampMs: event.timestampMs,
+      distToStopM: event.distToStopM,
+      speedMps: event.speedMps,
+      accuracyM: event.accuracyM,
+    });
+    insertedEvents += 1;
+    segmentUpdates += 1;
+  }
+
+  if (segmentUpdates > 0) {
+    await rebuildSegmentsForTrip(session.tripId);
   }
 
   const lastFix: BackgroundTripUpdate['lastFix'] = {
@@ -229,25 +355,36 @@ async function persistLocationForSession(
     speedMps: computedSpeed,
     headingDeg: coords.heading ?? null,
   };
+
   const nextSession: ActiveTripSession = {
     ...session,
-    detectorState: detection.nextState,
+    detectorState: legacyDetection.nextState,
+    v1StopState: v1Detection.nextState,
     lastFix: {
       timestampMs: lastFix.timestampMs,
       lat: lastFix.lat,
       lon: lastFix.lon,
+      accuracyM: lastFix.accuracyM,
       speedMps: lastFix.speedMps,
+      smoothedLat: smoothed.lat,
+      smoothedLon: smoothed.lon,
+      smoothedSpeedMps: smoothed.speedMps,
     } satisfies PersistedFix,
   };
+
+  const nextStop = v1Stops[v1Detection.nextState.expectedIndex] ?? null;
 
   return {
     session: nextSession,
     pointsInserted: 1,
     eventsInserted: insertedEvents,
+    segmentUpdates,
     lastFix,
-    nearestStopName: detection.nearestStop?.stop_name ?? null,
-    nearestStopDistanceM: detection.nearestDistanceM,
-    insideStopName: detection.insideStop?.stop_name ?? null,
-    insideState: detection.insideState,
+    nearestStopName: legacyDetection.nearestStop?.stop_name ?? null,
+    nearestStopDistanceM: legacyDetection.nearestDistanceM,
+    insideStopName: legacyDetection.insideStop?.stop_name ?? null,
+    insideState: legacyDetection.insideState,
+    lastFilterReason: filter.reason,
+    expectedNextStopName: nextStop?.name ?? null,
   };
 }
