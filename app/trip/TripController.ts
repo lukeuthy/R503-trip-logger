@@ -6,6 +6,7 @@ import type { StopEventRow } from '../models/StopEvent';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
 import { exportTripBundle } from '../src/services/export/exportBundle';
 import { haversineMeters } from '../src/services/location/filters';
+import { getAuditStats } from '../src/services/location/fileAudit';
 import { createInitialStopDetectionState } from '../src/services/location/stopDetector';
 import { createUuidV4 } from '../src/utils/id';
 import { loadSettings, saveSettings } from '../src/utils/settingsStore';
@@ -21,7 +22,13 @@ import {
   type BackgroundTripUpdate,
 } from './backgroundLocationTask';
 import { createInitialStopDetectorState, getStopDetectionConfig, type StopInfo } from './stopDetector';
-import { insertSessionMetadata, loadTripDebug, markSessionEnded, resolveVariantId } from '../src/db/queries';
+import {
+  insertSessionMetadata,
+  loadTrackingHealth,
+  loadTripDebug,
+  markSessionEnded,
+  resolveVariantId,
+} from '../src/db/queries';
 
 const APP_VERSION = '1.0.0-v1.0';
 const MAX_LOG_LINES = 40;
@@ -63,6 +70,12 @@ export interface UITripState {
   chartsMode: boolean;
   debugOverlayEnabled: boolean;
   lastFilterReason: string | null;
+  healthLegacyPoints: number;
+  healthV1Points: number;
+  healthStopEvents: number;
+  healthAuditLines: number;
+  healthLastWriteIso: string | null;
+  healthAuditPath: string | null;
   lastError: string | null;
   logs: string[];
 }
@@ -97,6 +110,12 @@ class TripController {
     chartsMode: true,
     debugOverlayEnabled: false,
     lastFilterReason: null,
+    healthLegacyPoints: 0,
+    healthV1Points: 0,
+    healthStopEvents: 0,
+    healthAuditLines: 0,
+    healthLastWriteIso: null,
+    healthAuditPath: null,
     lastError: null,
     logs: [],
   };
@@ -104,6 +123,7 @@ class TripController {
   private listeners = new Set<(state: UITripState) => void>();
   private stops: StopInfo[] = [];
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     setTripUpdateListener((update) => {
@@ -216,10 +236,17 @@ class TripController {
         lastExportTimestampIso: null,
         shareHint: null,
         lastFilterReason: null,
+        healthLegacyPoints: 0,
+        healthV1Points: 0,
+        healthStopEvents: 0,
+        healthAuditLines: 0,
+        healthLastWriteIso: null,
+        healthAuditPath: null,
         lastError: null,
       });
 
       this.startElapsedTimer();
+      this.startHealthTimer();
       const shareAvailable = await isSharingAvailable();
       this.setState({ shareAvailable, isBusy: false });
       this.appendLog(`Trip started: ${tripId}`);
@@ -278,6 +305,8 @@ class TripController {
       await clearActiveTripSession();
 
       this.stopElapsedTimer();
+      this.stopHealthTimer();
+      await this.refreshTrackingHealth();
       this.setState({
         status: 'stopped',
         isBusy: false,
@@ -470,6 +499,8 @@ class TripController {
       });
 
       this.startElapsedTimer();
+      this.startHealthTimer();
+      await this.refreshTrackingHealth();
       const running = await isBackgroundTrackingRunning();
       if (!running) {
         await startBackgroundTracking();
@@ -583,6 +614,7 @@ class TripController {
       insideState: update.insideState,
       lastFilterReason: update.lastFilterReason,
     });
+    void this.refreshTrackingHealth();
   }
 
   private async loadStops(directionCode: DirectionCode): Promise<StopInfo[]> {
@@ -621,6 +653,20 @@ class TripController {
     }
   }
 
+  private startHealthTimer(): void {
+    this.stopHealthTimer();
+    this.healthTimer = setInterval(() => {
+      void this.refreshTrackingHealth();
+    }, 5000);
+  }
+
+  private stopHealthTimer(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = null;
+    }
+  }
+
   private async safeBackgroundCleanup(): Promise<void> {
     try {
       await stopBackgroundTracking();
@@ -632,6 +678,7 @@ class TripController {
     } catch {
       // Best effort.
     }
+    this.stopHealthTimer();
   }
 
   private appendLog(message: string): void {
@@ -661,6 +708,25 @@ class TripController {
       segmentsCount: debug.segmentsCount,
       lastFilterReason: debug.lastFilterReason,
     });
+  }
+
+  async refreshTrackingHealth(): Promise<void> {
+    if (!this.state.tripId) {
+      return;
+    }
+    try {
+      const [dbHealth, audit] = await Promise.all([loadTrackingHealth(this.state.tripId), getAuditStats()]);
+      this.setState({
+        healthLegacyPoints: dbHealth.legacyPoints,
+        healthV1Points: dbHealth.v1Points,
+        healthStopEvents: dbHealth.stopEvents,
+        healthAuditLines: audit.lines,
+        healthLastWriteIso: dbHealth.lastV1TsIso ?? (dbHealth.lastLegacyTsMs ? new Date(dbHealth.lastLegacyTsMs).toISOString() : null),
+        healthAuditPath: audit.path,
+      });
+    } catch (error) {
+      this.appendLog(`Health refresh warning: ${getErrorMessage(error)}`);
+    }
   }
 }
 

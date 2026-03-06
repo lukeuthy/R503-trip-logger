@@ -74,6 +74,16 @@ export function DashboardScreen() {
         />
       </GlassCard>
 
+      <GlassCard>
+        <Text style={styles.tableHeader}>Tracking Health</Text>
+        <Text style={styles.cell}>DB Legacy Points: {state.healthLegacyPoints}</Text>
+        <Text style={styles.cell}>DB v1 Points: {state.healthV1Points}</Text>
+        <Text style={styles.cell}>DB Stop Events: {state.healthStopEvents}</Text>
+        <Text style={styles.cell}>Audit File Lines: {state.healthAuditLines}</Text>
+        <Text style={styles.cell}>Last DB Write: {state.healthLastWriteIso ?? '-'}</Text>
+        <Text style={styles.cell}>Audit Path: {state.healthAuditPath ?? '-'}</Text>
+      </GlassCard>
+
       {state.chartsMode ? (
         <GlassCard>
           <MiniChart title="Speed Over Time" values={speedHistory} color="#34d399" />

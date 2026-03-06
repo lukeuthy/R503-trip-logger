@@ -235,6 +235,34 @@ export async function loadTripDebug(tripId: string): Promise<{
   };
 }
 
+export async function loadTrackingHealth(tripId: string): Promise<{
+  legacyPoints: number;
+  v1Points: number;
+  stopEvents: number;
+  lastLegacyTsMs: number | null;
+  lastV1TsIso: string | null;
+}> {
+  const db = await getDb();
+  const legacyPoints = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM gps_point WHERE trip_id = ?;', [
+    tripId,
+  ]);
+  const v1Points = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM gps_points WHERE trip_id = ?;', [tripId]);
+  const stopEvents = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM stop_events WHERE trip_id = ?;', [tripId]);
+  const lastLegacy = await db.getFirstAsync<{ timestamp_ms: number }>(
+    'SELECT timestamp_ms FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1;',
+    [tripId],
+  );
+  const lastV1 = await db.getFirstAsync<{ ts: string }>('SELECT ts FROM gps_points WHERE trip_id = ? ORDER BY ts DESC LIMIT 1;', [tripId]);
+
+  return {
+    legacyPoints: legacyPoints?.count ?? 0,
+    v1Points: v1Points?.count ?? 0,
+    stopEvents: stopEvents?.count ?? 0,
+    lastLegacyTsMs: lastLegacy?.timestamp_ms ?? null,
+    lastV1TsIso: lastV1?.ts ?? null,
+  };
+}
+
 export async function saveDetectionState(tripId: string, state: StopDetectionState): Promise<void> {
   const db = await getDb();
   await db.runAsync(
