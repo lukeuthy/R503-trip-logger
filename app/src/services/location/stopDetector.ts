@@ -14,6 +14,7 @@ export interface StopDetectionState {
   activeStopId: string | null;
   enteredAtMs: number | null;
   departCandidateSinceMs: number | null;
+  lastProcessedTimestampMs: number | null;
 }
 
 export interface StopDetectionConfig {
@@ -57,6 +58,7 @@ export function createInitialStopDetectionState(): StopDetectionState {
     activeStopId: null,
     enteredAtMs: null,
     departCandidateSinceMs: null,
+    lastProcessedTimestampMs: null,
   };
 }
 
@@ -89,6 +91,17 @@ export function evaluateSequencedStopDetection(
 
   const next: StopDetectionState = { ...state };
   const events: StopEventCandidate[] = [];
+
+  if (next.lastProcessedTimestampMs != null && point.timestampMs <= next.lastProcessedTimestampMs) {
+    return {
+      nextState: next,
+      nearestStopId: nearest.stop?.stopId ?? null,
+      nearestDistanceM: nearest.distanceM,
+      activeStopId: next.activeStopId,
+      events,
+    };
+  }
+  next.lastProcessedTimestampMs = point.timestampMs;
 
   if (!targetStop || distToTargetM == null) {
     return {

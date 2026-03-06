@@ -3,6 +3,7 @@ import { Platform } from 'react-native';
 import { getDb } from '../../database/db';
 import { deriveSegments } from '../services/location/segmentBuilder';
 import type { RouteStop, StopDetectionState } from '../services/location/stopDetector';
+import { appendAuditLog } from '../services/location/fileAudit';
 import { createUuidV4 } from '../utils/id';
 import { loadSettings, saveSettings } from '../utils/settingsStore';
 import type { DirectionCode, WindowCode } from '../../models/Trip';
@@ -25,6 +26,10 @@ export interface PersistPointInput {
   altitudeM: number | null;
   speedMps: number | null;
   headingDeg: number | null;
+  derivedSpeedMps: number | null;
+  derivedHeadingDeg: number | null;
+  providerSpeedMps: number | null;
+  providerHeadingDeg: number | null;
   isFiltered: boolean;
   filterReason: string | null;
   smoothedLat: number | null;
@@ -117,8 +122,8 @@ export async function persistPoint(input: PersistPointInput): Promise<void> {
   const pointId = createUuidV4();
   await db.runAsync(
     `INSERT INTO gps_points
-      (point_id, trip_id, ts, lat, lng, accuracy_m, altitude_m, speed_mps, bearing_deg, is_filtered, filter_reason, smoothed_lat, smoothed_lng, smoothed_speed_mps)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+      (point_id, trip_id, ts, lat, lng, accuracy_m, altitude_m, speed_mps, bearing_deg, derived_speed_mps, derived_heading_deg, provider_speed_mps, provider_heading_deg, is_filtered, filter_reason, smoothed_lat, smoothed_lng, smoothed_speed_mps)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
       pointId,
       input.tripId,
@@ -129,6 +134,10 @@ export async function persistPoint(input: PersistPointInput): Promise<void> {
       input.altitudeM,
       input.speedMps,
       input.headingDeg,
+      input.derivedSpeedMps,
+      input.derivedHeadingDeg,
+      input.providerSpeedMps,
+      input.providerHeadingDeg,
       input.isFiltered ? 1 : 0,
       input.filterReason,
       input.smoothedLat,
@@ -138,8 +147,43 @@ export async function persistPoint(input: PersistPointInput): Promise<void> {
   );
 }
 
-export async function persistStopEvent(input: PersistStopEventInput): Promise<void> {
+export async function persistStopEvent(input: PersistStopEventInput): Promise<boolean> {
   const db = await getDb();
+  const lastForStop = await db.getFirstAsync<{ event_type: 'arrive' | 'depart'; ts: string }>(
+    `SELECT event_type, ts FROM stop_events
+     WHERE trip_id = ? AND stop_id = ?
+     ORDER BY ts DESC
+     LIMIT 1;`,
+    [input.tripId, input.stopId],
+  );
+  if (lastForStop) {
+    const lastTs = new Date(lastForStop.ts).getTime();
+    if (input.timestampMs <= lastTs) {
+      await appendAuditLog({
+        scope: 'stop-event',
+        action: 'suppressed',
+        reason: 'non-forward-time',
+        trip_id: input.tripId,
+        stop_id: input.stopId,
+        event_type: input.eventType,
+        ts: input.timestampMs,
+      });
+      return false;
+    }
+    if (lastForStop.event_type === input.eventType) {
+      await appendAuditLog({
+        scope: 'stop-event',
+        action: 'suppressed',
+        reason: 'duplicate-consecutive-event',
+        trip_id: input.tripId,
+        stop_id: input.stopId,
+        event_type: input.eventType,
+        ts: input.timestampMs,
+      });
+      return false;
+    }
+  }
+
   const eventId = createUuidV4();
   await db.runAsync(
     `INSERT INTO stop_events (event_id, trip_id, stop_id, event_type, ts, dist_to_stop_m, speed_mps, accuracy_m)
@@ -155,10 +199,31 @@ export async function persistStopEvent(input: PersistStopEventInput): Promise<vo
       input.accuracyM,
     ],
   );
+  await appendAuditLog({
+    scope: 'stop-event',
+    action: 'persisted',
+    trip_id: input.tripId,
+    stop_id: input.stopId,
+    event_type: input.eventType,
+    ts: input.timestampMs,
+  });
+  return true;
 }
 
 export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
   const db = await getDb();
+  const stopOrders = await db.getAllAsync<{ stop_id: string; stop_order: number }>(
+    `SELECT s.stop_id, s.stop_order
+     FROM stops s
+     INNER JOIN trip_sessions t ON t.variant_id = s.variant_id
+     WHERE t.trip_id = ?;`,
+    [tripId],
+  );
+  const stopOrderByStopId: Record<string, number> = {};
+  for (const row of stopOrders) {
+    stopOrderByStopId[row.stop_id] = row.stop_order;
+  }
+
   const events = await db.getAllAsync<{
     stop_id: string;
     event_type: 'arrive' | 'depart';
@@ -172,7 +237,7 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
     accuracy_m: number | null;
   }>('SELECT ts, lat, lng, speed_mps, accuracy_m FROM gps_points WHERE trip_id = ? ORDER BY ts ASC;', [tripId]);
 
-  const derived = deriveSegments(
+  const derivedResult = deriveSegments(
     events.map((event) => ({
       stopId: event.stop_id,
       eventType: event.event_type,
@@ -185,7 +250,9 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
       speedMps: point.speed_mps,
       accuracyM: point.accuracy_m,
     })),
+    stopOrderByStopId,
   );
+  const derived = derivedResult.segments;
 
   await db.runAsync('DELETE FROM segment_times WHERE trip_id = ?;', [tripId]);
   for (const segment of derived) {
@@ -207,6 +274,26 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
         segment.meanAccuracyM,
       ],
     );
+    await appendAuditLog({
+      scope: 'segment',
+      action: 'completed',
+      trip_id: tripId,
+      from_stop_id: segment.fromStopId,
+      to_stop_id: segment.toStopId,
+      start_ts: segment.startTsMs,
+      end_ts: segment.endTsMs,
+    });
+  }
+  for (const item of derivedResult.meta.suppressed) {
+    await appendAuditLog({
+      scope: 'segment',
+      action: 'suppressed',
+      trip_id: tripId,
+      reason: item.reason,
+      from_stop_id: item.fromStopId ?? null,
+      to_stop_id: item.toStopId ?? null,
+      ts: item.atTsMs,
+    });
   }
 }
 

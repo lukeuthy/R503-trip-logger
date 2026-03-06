@@ -26,25 +26,92 @@ export interface DerivedSegment {
   meanAccuracyM: number | null;
 }
 
-export function deriveSegments(events: SegmentInputEvent[], points: SegmentInputPoint[]): DerivedSegment[] {
+export interface SegmentDerivationMeta {
+  suppressed: Array<{ reason: string; fromStopId?: string; toStopId?: string; atTsMs: number }>;
+  completed: number;
+}
+
+export function deriveSegments(
+  events: SegmentInputEvent[],
+  points: SegmentInputPoint[],
+  stopOrderByStopId: Record<string, number>,
+): { segments: DerivedSegment[]; meta: SegmentDerivationMeta } {
   const orderedEvents = [...events].sort((a, b) => a.timestampMs - b.timestampMs);
   const orderedPoints = [...points].sort((a, b) => a.timestampMs - b.timestampMs);
   const segments: DerivedSegment[] = [];
+  const suppressed: SegmentDerivationMeta['suppressed'] = [];
 
-  for (let index = 0; index < orderedEvents.length - 1; index += 1) {
-    const first = orderedEvents[index];
-    const second = orderedEvents[index + 1];
-    if (first.eventType !== 'depart' || second.eventType !== 'arrive') {
+  let pendingDepart: SegmentInputEvent | null = null;
+  const usedKeys = new Set<string>();
+
+  for (const event of orderedEvents) {
+    const eventOrder = stopOrderByStopId[event.stopId];
+    if (eventOrder == null) {
+      suppressed.push({ reason: 'unknown-stop-order', fromStopId: event.stopId, atTsMs: event.timestampMs });
       continue;
     }
-    if (second.timestampMs <= first.timestampMs) {
+
+    if (event.eventType === 'depart') {
+      if (pendingDepart && pendingDepart.stopId === event.stopId) {
+        suppressed.push({ reason: 'duplicate-depart-same-stop', fromStopId: event.stopId, atTsMs: event.timestampMs });
+        continue;
+      }
+      pendingDepart = event;
       continue;
     }
+
+    if (!pendingDepart) {
+      suppressed.push({ reason: 'arrive-without-depart', toStopId: event.stopId, atTsMs: event.timestampMs });
+      continue;
+    }
+
+    const fromOrder = stopOrderByStopId[pendingDepart.stopId];
+    const toOrder = stopOrderByStopId[event.stopId];
+    if (fromOrder == null || toOrder == null) {
+      suppressed.push({
+        reason: 'missing-stop-order-on-transition',
+        fromStopId: pendingDepart.stopId,
+        toStopId: event.stopId,
+        atTsMs: event.timestampMs,
+      });
+      pendingDepart = null;
+      continue;
+    }
+    if (toOrder !== fromOrder + 1) {
+      suppressed.push({
+        reason: 'non-consecutive-transition',
+        fromStopId: pendingDepart.stopId,
+        toStopId: event.stopId,
+        atTsMs: event.timestampMs,
+      });
+      continue;
+    }
+    if (event.timestampMs <= pendingDepart.timestampMs) {
+      suppressed.push({
+        reason: 'non-forward-time-transition',
+        fromStopId: pendingDepart.stopId,
+        toStopId: event.stopId,
+        atTsMs: event.timestampMs,
+      });
+      continue;
+    }
+
+    const dedupeKey = `${pendingDepart.stopId}->${event.stopId}@${pendingDepart.timestampMs}->${event.timestampMs}`;
+    if (usedKeys.has(dedupeKey)) {
+      suppressed.push({
+        reason: 'duplicate-segment-window',
+        fromStopId: pendingDepart.stopId,
+        toStopId: event.stopId,
+        atTsMs: event.timestampMs,
+      });
+      pendingDepart = null;
+      continue;
+    }
+    usedKeys.add(dedupeKey);
 
     const windowPoints = orderedPoints.filter(
-      (point) => point.timestampMs >= first.timestampMs && point.timestampMs <= second.timestampMs,
+      (point) => point.timestampMs >= pendingDepart!.timestampMs && point.timestampMs <= event.timestampMs,
     );
-
     const distanceM = getPolylineDistance(windowPoints);
     const speedValues = windowPoints.map((point) => point.speedMps).filter((value): value is number => value != null);
     const accuracyValues = windowPoints
@@ -52,26 +119,32 @@ export function deriveSegments(events: SegmentInputEvent[], points: SegmentInput
       .filter((value): value is number => value != null && Number.isFinite(value));
 
     segments.push({
-      fromStopId: first.stopId,
-      toStopId: second.stopId,
-      startTsMs: first.timestampMs,
-      endTsMs: second.timestampMs,
-      travelTimeSec: Math.max(1, Math.round((second.timestampMs - first.timestampMs) / 1000)),
+      fromStopId: pendingDepart.stopId,
+      toStopId: event.stopId,
+      startTsMs: pendingDepart.timestampMs,
+      endTsMs: event.timestampMs,
+      travelTimeSec: Math.max(1, Math.round((event.timestampMs - pendingDepart.timestampMs) / 1000)),
       distanceM,
       avgSpeedMps: mean(speedValues),
       p95SpeedMps: percentile(speedValues, 95),
       meanAccuracyM: mean(accuracyValues),
     });
+    pendingDepart = null;
   }
 
-  return segments;
+  return {
+    segments,
+    meta: {
+      suppressed,
+      completed: segments.length,
+    },
+  };
 }
 
 function getPolylineDistance(points: SegmentInputPoint[]): number {
   if (points.length < 2) {
     return 0;
   }
-
   let total = 0;
   for (let index = 1; index < points.length; index += 1) {
     const prev = points[index - 1];

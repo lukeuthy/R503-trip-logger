@@ -11,6 +11,7 @@ import {
   resolveVariantId,
 } from '../src/db/queries';
 import { applyEmaSmoothing, filterRawPoint } from '../src/services/location/filters';
+import { deriveHeadingDeg } from '../src/services/location/filters';
 import {
   createInitialStopDetectionState,
   DEFAULT_STOP_CONFIG,
@@ -132,6 +133,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
       if (locations.length === 0) {
         return;
       }
+      const sortedLocations = [...locations].sort((a, b) => a.timestamp - b.timestamp);
 
       const session = await loadActiveTripSession();
       if (!session) {
@@ -152,7 +154,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
         v1StopState: session.v1StopState ?? createInitialStopDetectionState(),
       };
 
-      for (const position of locations) {
+      for (const position of sortedLocations) {
         const result = await persistLocationForSession(mutableSession, legacyStops, v1Stops, position);
         mutableSession = result.session;
         pointsInserted += result.pointsInserted;
@@ -239,24 +241,34 @@ async function persistLocationForSession(
       }
     : null;
 
-  const computedSpeed = calculateSpeedMps(
+  const providerSpeed = coords.speed != null && Number.isFinite(coords.speed) && coords.speed >= 0 ? coords.speed : null;
+  const providerHeading = coords.heading != null && Number.isFinite(coords.heading) && coords.heading >= 0 ? coords.heading : null;
+  const derivedSpeed = calculateSpeedMps(
     previous,
     {
       lat: coords.latitude,
       lon: coords.longitude,
       timestampMs: position.timestamp,
     },
-    coords.speed ?? null,
+    null,
   );
+  const movementSpeedMps =
+    providerSpeed != null && providerSpeed > 0.5 ? providerSpeed : derivedSpeed != null && derivedSpeed > 0.5 ? derivedSpeed : providerSpeed;
+  const derivedHeading =
+    movementSpeedMps != null && movementSpeedMps > 0.5 ? deriveHeadingDeg(previous, { lat: coords.latitude, lon: coords.longitude }) : null;
+  const headingForStorage =
+    providerHeading != null && !(providerHeading === 0 && (derivedHeading ?? 0) > 1) ? providerHeading : derivedHeading;
+
+  const isOutOfOrder = session.lastFix != null && position.timestamp <= session.lastFix.timestampMs;
 
   const rawPoint = {
     timestampMs: position.timestamp,
     lat: coords.latitude,
     lon: coords.longitude,
     accuracyM: coords.accuracy ?? null,
-    speedMps: computedSpeed,
+    speedMps: movementSpeedMps ?? null,
   };
-  const filter = filterRawPoint(
+  const baseFilter = filterRawPoint(
     session.lastFix
       ? {
           timestampMs: session.lastFix.timestampMs,
@@ -268,39 +280,81 @@ async function persistLocationForSession(
       : null,
     rawPoint,
   );
+  const filter = isOutOfOrder
+    ? {
+        isFiltered: true,
+        reason: 'out-of-order-timestamp',
+        impliedSpeedMps: baseFilter.impliedSpeedMps,
+        jumpDistanceM: baseFilter.jumpDistanceM,
+      }
+    : baseFilter;
   const settings = await loadSettings();
-  const smoothed = applyEmaSmoothing(
-    session.lastFix
-      ? {
-          lat: session.lastFix.smoothedLat ?? session.lastFix.lat,
-          lon: session.lastFix.smoothedLon ?? session.lastFix.lon,
-          speedMps: session.lastFix.smoothedSpeedMps ?? session.lastFix.speedMps,
-        }
-      : null,
-    {
-      lat: rawPoint.lat,
-      lon: rawPoint.lon,
-      speedMps: rawPoint.speedMps,
-    },
-    settings.smoothingAlpha,
-  );
+  const previousSmoothed = session.lastFix
+    ? {
+        lat: session.lastFix.smoothedLat ?? session.lastFix.lat,
+        lon: session.lastFix.smoothedLon ?? session.lastFix.lon,
+        speedMps: session.lastFix.smoothedSpeedMps ?? session.lastFix.speedMps,
+      }
+    : null;
+  const smoothed = filter.isFiltered
+    ? previousSmoothed ?? {
+        lat: rawPoint.lat,
+        lon: rawPoint.lon,
+        speedMps: rawPoint.speedMps,
+      }
+    : applyEmaSmoothing(
+        previousSmoothed,
+        {
+          lat: rawPoint.lat,
+          lon: rawPoint.lon,
+          speedMps: rawPoint.speedMps,
+        },
+        settings.smoothingAlpha,
+      );
+
+  await appendAuditLog({
+    scope: 'gps-point',
+    action: 'received',
+    trip_id: session.tripId,
+    ts: position.timestamp,
+    lat: coords.latitude,
+    lon: coords.longitude,
+    accuracy_m: coords.accuracy ?? null,
+    provider_speed_mps: providerSpeed,
+    derived_speed_mps: derivedSpeed,
+    provider_heading_deg: providerHeading,
+    derived_heading_deg: derivedHeading,
+  });
+  if (filter.isFiltered) {
+    await appendAuditLog({
+      scope: 'gps-point',
+      action: 'filtered',
+      trip_id: session.tripId,
+      ts: position.timestamp,
+      reason: filter.reason,
+      implied_speed_mps: filter.impliedSpeedMps,
+      jump_distance_m: filter.jumpDistanceM,
+    });
+  }
 
   await db.runAsync(
-    `INSERT INTO gps_point (trip_id, timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg, is_filtered, filter_reason, smoothed_lat, smoothed_lon, smoothed_speed_mps)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO gps_point (trip_id, timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg, is_filtered, filter_reason, smoothed_lat, smoothed_lon, smoothed_speed_mps, derived_speed_mps, derived_heading_deg)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
       session.tripId,
       position.timestamp,
       coords.latitude,
       coords.longitude,
       coords.accuracy ?? null,
-      computedSpeed,
-      coords.heading ?? null,
+      movementSpeedMps ?? null,
+      headingForStorage ?? null,
       filter.isFiltered ? 1 : 0,
       filter.reason,
       smoothed.lat,
       smoothed.lon,
       smoothed.speedMps,
+      derivedSpeed,
+      derivedHeading,
     ],
   );
 
@@ -311,13 +365,17 @@ async function persistLocationForSession(
     lon: coords.longitude,
     accuracyM: coords.accuracy ?? null,
     altitudeM: coords.altitude ?? null,
-    speedMps: computedSpeed,
-    headingDeg: coords.heading ?? null,
+    speedMps: movementSpeedMps ?? null,
+    headingDeg: headingForStorage ?? null,
     isFiltered: filter.isFiltered,
     filterReason: filter.reason,
     smoothedLat: smoothed.lat,
     smoothedLng: smoothed.lon,
     smoothedSpeedMps: smoothed.speedMps,
+    derivedSpeedMps: derivedSpeed,
+    derivedHeadingDeg: derivedHeading,
+    providerSpeedMps: providerSpeed,
+    providerHeadingDeg: providerHeading,
   });
   await appendAuditLog({
     scope: 'gps-write',
@@ -326,48 +384,86 @@ async function persistLocationForSession(
     lat: coords.latitude,
     lon: coords.longitude,
     accuracy_m: coords.accuracy ?? null,
-    speed_mps: computedSpeed,
+    speed_mps: movementSpeedMps ?? null,
     is_filtered: filter.isFiltered ? 1 : 0,
     filter_reason: filter.reason,
   });
 
-  const legacyDetection = evaluateStopDetection(session.detectorState, legacyStops, {
-    lat: coords.latitude,
-    lon: coords.longitude,
-    timestampMs: position.timestamp,
-  });
+  const legacyDetection = filter.isFiltered
+    ? {
+        nearestStop: null,
+        nearestDistanceM: null,
+        insideStop: null,
+        insideState: 'OUTSIDE' as const,
+        events: [],
+        nextState: session.detectorState,
+      }
+    : evaluateStopDetection(session.detectorState, legacyStops, {
+        lat: coords.latitude,
+        lon: coords.longitude,
+        timestampMs: position.timestamp,
+      });
 
-  const v1Detection = evaluateSequencedStopDetection(
-    session.v1StopState ?? createInitialStopDetectionState(),
-    v1Stops,
-    {
-      timestampMs: position.timestamp,
-      lat: filter.isFiltered ? smoothed.lat : coords.latitude,
-      lon: filter.isFiltered ? smoothed.lon : coords.longitude,
-      speedMps: computedSpeed,
-      accuracyM: coords.accuracy ?? null,
-    },
-    {
-      ...DEFAULT_STOP_CONFIG,
-      enterRadiusM: settings.enterRadiusM,
-      exitRadiusM: settings.exitRadiusM,
-    },
-  );
+  const v1Detection = filter.isFiltered
+    ? {
+        nextState: session.v1StopState ?? createInitialStopDetectionState(),
+        nearestStopId: null,
+        nearestDistanceM: null,
+        activeStopId: null,
+        events: [],
+      }
+    : evaluateSequencedStopDetection(
+        session.v1StopState ?? createInitialStopDetectionState(),
+        v1Stops,
+        {
+          timestampMs: position.timestamp,
+          lat: coords.latitude,
+          lon: coords.longitude,
+          speedMps: movementSpeedMps,
+          accuracyM: coords.accuracy ?? null,
+        },
+        {
+          ...DEFAULT_STOP_CONFIG,
+          enterRadiusM: settings.enterRadiusM,
+          exitRadiusM: settings.exitRadiusM,
+        },
+      );
 
   let insertedEvents = 0;
   let segmentUpdates = 0;
 
   for (const event of legacyDetection.events) {
+    const shouldPersist = await shouldPersistLegacyEvent(db, session.tripId, event.stop_id, event.event_type, event.timestamp_ms);
+    if (!shouldPersist) {
+      await appendAuditLog({
+        scope: 'legacy-stop-event',
+        action: 'suppressed',
+        reason: 'duplicate-or-out-of-order',
+        trip_id: session.tripId,
+        stop_id: event.stop_id,
+        event_type: event.event_type,
+        ts: event.timestamp_ms,
+      });
+      continue;
+    }
     await db.runAsync(
       `INSERT INTO stop_event (trip_id, stop_id, event_type, timestamp_ms, dist_m, lat, lon)
        VALUES (?, ?, ?, ?, ?, ?, ?);`,
       [session.tripId, event.stop_id, event.event_type, event.timestamp_ms, event.dist_m, event.lat, event.lon],
     );
     insertedEvents += 1;
+    await appendAuditLog({
+      scope: 'legacy-stop-event',
+      action: 'fired',
+      trip_id: session.tripId,
+      stop_id: event.stop_id,
+      event_type: event.event_type,
+      ts: event.timestamp_ms,
+    });
   }
 
   for (const event of v1Detection.events) {
-    await persistStopEvent({
+    const persisted = await persistStopEvent({
       tripId: session.tripId,
       stopId: event.stopId,
       eventType: event.eventType,
@@ -376,8 +472,31 @@ async function persistLocationForSession(
       speedMps: event.speedMps,
       accuracyM: event.accuracyM,
     });
+    if (!persisted) {
+      continue;
+    }
     insertedEvents += 1;
-    segmentUpdates += 1;
+    if (event.eventType === 'arrive') {
+      await appendAuditLog({
+        scope: 'stop-event',
+        action: 'fired',
+        trip_id: session.tripId,
+        stop_id: event.stopId,
+        event_type: event.eventType,
+        ts: event.timestampMs,
+      });
+    }
+    if (event.eventType === 'depart') {
+      segmentUpdates += 1;
+      await appendAuditLog({
+        scope: 'stop-event',
+        action: 'fired',
+        trip_id: session.tripId,
+        stop_id: event.stopId,
+        event_type: event.eventType,
+        ts: event.timestampMs,
+      });
+    }
   }
 
   if (segmentUpdates > 0) {
@@ -389,8 +508,8 @@ async function persistLocationForSession(
     lat: coords.latitude,
     lon: coords.longitude,
     accuracyM: coords.accuracy ?? null,
-    speedMps: computedSpeed,
-    headingDeg: coords.heading ?? null,
+    speedMps: movementSpeedMps ?? null,
+    headingDeg: headingForStorage ?? null,
   };
 
   const nextSession: ActiveTripSession = {
@@ -424,4 +543,31 @@ async function persistLocationForSession(
     lastFilterReason: filter.reason,
     expectedNextStopName: nextStop?.name ?? null,
   };
+}
+
+async function shouldPersistLegacyEvent(
+  db: Awaited<ReturnType<typeof getDb>>,
+  tripId: string,
+  stopId: number,
+  eventType: string,
+  timestampMs: number,
+): Promise<boolean> {
+  const last = await db.getFirstAsync<{ event_type: string; timestamp_ms: number }>(
+    `SELECT event_type, timestamp_ms
+     FROM stop_event
+     WHERE trip_id = ? AND stop_id = ?
+     ORDER BY timestamp_ms DESC
+     LIMIT 1;`,
+    [tripId, stopId],
+  );
+  if (!last) {
+    return true;
+  }
+  if (timestampMs <= last.timestamp_ms) {
+    return false;
+  }
+  if (last.event_type === eventType) {
+    return false;
+  }
+  return true;
 }

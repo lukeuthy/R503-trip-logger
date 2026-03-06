@@ -38,6 +38,12 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'gps_point', 'smoothed_lat', 'ALTER TABLE gps_point ADD COLUMN smoothed_lat REAL;');
   await ensureColumn(db, 'gps_point', 'smoothed_lon', 'ALTER TABLE gps_point ADD COLUMN smoothed_lon REAL;');
   await ensureColumn(db, 'gps_point', 'smoothed_speed_mps', 'ALTER TABLE gps_point ADD COLUMN smoothed_speed_mps REAL;');
+  await ensureColumn(db, 'gps_point', 'derived_speed_mps', 'ALTER TABLE gps_point ADD COLUMN derived_speed_mps REAL;');
+  await ensureColumn(db, 'gps_point', 'derived_heading_deg', 'ALTER TABLE gps_point ADD COLUMN derived_heading_deg REAL;');
+  await ensureColumn(db, 'gps_points', 'derived_speed_mps', 'ALTER TABLE gps_points ADD COLUMN derived_speed_mps REAL;');
+  await ensureColumn(db, 'gps_points', 'derived_heading_deg', 'ALTER TABLE gps_points ADD COLUMN derived_heading_deg REAL;');
+  await ensureColumn(db, 'gps_points', 'provider_speed_mps', 'ALTER TABLE gps_points ADD COLUMN provider_speed_mps REAL;');
+  await ensureColumn(db, 'gps_points', 'provider_heading_deg', 'ALTER TABLE gps_points ADD COLUMN provider_heading_deg REAL;');
 }
 
 async function ensureColumn(
