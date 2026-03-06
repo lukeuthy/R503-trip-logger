@@ -51,12 +51,21 @@ export function TripScreen() {
 
       <GlassCard>
         <Text style={styles.metric}>Trip ID: {state.tripId ?? '-'}</Text>
+        <Text style={styles.metric}>Elapsed: {formatElapsed(state.elapsedSeconds)}</Text>
         <Text style={styles.metric}>Points: {state.pointsCount}</Text>
         <Text style={styles.metric}>Events: {state.eventsCount}</Text>
         <Text style={styles.metric}>Last Error: {state.lastError ?? '-'}</Text>
       </GlassCard>
     </ScrollView>
   );
+}
+
+function formatElapsed(totalSeconds: number): string {
+  const seconds = Math.max(0, totalSeconds);
+  const hh = Math.floor(seconds / 3600);
+  const mm = Math.floor((seconds % 3600) / 60);
+  const ss = seconds % 60;
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
 }
 
 function Selector<T extends string>(props: {

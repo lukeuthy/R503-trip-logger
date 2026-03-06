@@ -1,8 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
-import JSZip from 'jszip';
 
 import { getDb } from '../../../database/db';
 import { loadExportMetadata } from '../../db/queries';
+import { getAuditFilePath } from '../location/fileAudit';
 
 export interface ExportBundleResult {
   rootDir: string;
@@ -29,6 +29,16 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
   );
 
   const metadata = await loadExportMetadata(tripId);
+  let auditLogContent = '';
+  try {
+    const auditPath = getAuditFilePath();
+    const info = await FileSystem.getInfoAsync(auditPath);
+    if (info.exists) {
+      auditLogContent = await FileSystem.readAsStringAsync(auditPath);
+    }
+  } catch {
+    auditLogContent = '';
+  }
   const metadataContent = JSON.stringify(
     {
       trip_id: tripId,
@@ -37,7 +47,7 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
       device_id: metadata.deviceId,
       route_variant: metadata.variantId,
       exported_at: new Date().toISOString(),
-      files: ['trip_sessions.csv', 'gps_points.csv', 'stop_events.csv', 'segment_times.csv'],
+      files: ['trip_sessions.csv', 'gps_points.csv', 'stop_events.csv', 'segment_times.csv', 'tracking_audit.log'],
     },
     null,
     2,
@@ -49,6 +59,7 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
     { name: 'stop_events.csv', content: toCsv(stopEvents) },
     { name: 'segment_times.csv', content: toCsv(segmentTimes) },
     { name: 'metadata.json', content: metadataContent },
+    { name: 'tracking_audit.log', content: auditLogContent },
     {
       name: 'bundle.json',
       content: JSON.stringify({ trip_sessions: sessions, gps_points: gpsPoints, stop_events: stopEvents, segment_times: segmentTimes }, null, 2),
@@ -60,6 +71,7 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
   }
 
   const zipPath = `${rootDir}bundle.zip`;
+  const { default: JSZip } = await import('jszip');
   const zip = new JSZip();
   for (const file of files) {
     zip.file(file.name, file.content);

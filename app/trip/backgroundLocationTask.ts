@@ -17,6 +17,7 @@ import {
   evaluateSequencedStopDetection,
   type RouteStop,
 } from '../src/services/location/stopDetector';
+import { appendAuditLog } from '../src/services/location/fileAudit';
 import { loadSettings } from '../src/utils/settingsStore';
 import { calculateSpeedMps } from './speedCalculator';
 import type { ActiveTripSession, PersistedFix } from './activeTripStore';
@@ -104,59 +105,72 @@ export async function stopBackgroundTracking(): Promise<void> {
 
 if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
   TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{ locations?: Location.LocationObject[] }>) => {
-    const { data, error } = taskBody;
-    if (error) {
-      return;
-    }
+    try {
+      const { data, error } = taskBody;
+      if (error) {
+        await appendAuditLog({
+          scope: 'background-task',
+          type: 'task-error',
+          message: error.message,
+        });
+        return;
+      }
 
-    const locations = (data as { locations?: Location.LocationObject[] } | undefined)?.locations ?? [];
-    if (locations.length === 0) {
-      return;
-    }
+      const locations = (data as { locations?: Location.LocationObject[] } | undefined)?.locations ?? [];
+      if (locations.length === 0) {
+        return;
+      }
 
-    const session = await loadActiveTripSession();
-    if (!session) {
-      return;
-    }
+      const session = await loadActiveTripSession();
+      if (!session) {
+        return;
+      }
 
-    const legacyStops = await loadLegacyStopsForDirection(session.directionCode);
-    const variantId = session.variantId ?? resolveVariantId(session.directionCode, session.windowCode);
-    const v1Stops = await loadStopsForVariant(variantId);
+      const legacyStops = await loadLegacyStopsForDirection(session.directionCode);
+      const variantId = session.variantId ?? resolveVariantId(session.directionCode, session.windowCode);
+      const v1Stops = await loadStopsForVariant(variantId);
 
-    let pointsInserted = 0;
-    let eventsInserted = 0;
-    let segmentUpdates = 0;
-    let lastUpdate: BackgroundTripUpdate | null = null;
-    let mutableSession: ActiveTripSession = {
-      ...session,
-      variantId,
-      v1StopState: session.v1StopState ?? createInitialStopDetectionState(),
-    };
-
-    for (const position of locations) {
-      const result = await persistLocationForSession(mutableSession, legacyStops, v1Stops, position);
-      mutableSession = result.session;
-      pointsInserted += result.pointsInserted;
-      eventsInserted += result.eventsInserted;
-      segmentUpdates += result.segmentUpdates;
-      lastUpdate = {
-        tripId: mutableSession.tripId,
-        pointsInserted,
-        eventsInserted,
-        segmentUpdates,
-        lastFix: result.lastFix,
-        nearestStopName: result.nearestStopName,
-        nearestStopDistanceM: result.nearestStopDistanceM,
-        insideStopName: result.insideStopName,
-        insideState: result.insideState,
-        lastFilterReason: result.lastFilterReason,
-        expectedNextStopName: result.expectedNextStopName,
+      let pointsInserted = 0;
+      let eventsInserted = 0;
+      let segmentUpdates = 0;
+      let lastUpdate: BackgroundTripUpdate | null = null;
+      let mutableSession: ActiveTripSession = {
+        ...session,
+        variantId,
+        v1StopState: session.v1StopState ?? createInitialStopDetectionState(),
       };
-    }
 
-    await saveActiveTripSession(mutableSession);
-    if (lastUpdate && tripUpdateListener) {
-      tripUpdateListener(lastUpdate);
+      for (const position of locations) {
+        const result = await persistLocationForSession(mutableSession, legacyStops, v1Stops, position);
+        mutableSession = result.session;
+        pointsInserted += result.pointsInserted;
+        eventsInserted += result.eventsInserted;
+        segmentUpdates += result.segmentUpdates;
+        lastUpdate = {
+          tripId: mutableSession.tripId,
+          pointsInserted,
+          eventsInserted,
+          segmentUpdates,
+          lastFix: result.lastFix,
+          nearestStopName: result.nearestStopName,
+          nearestStopDistanceM: result.nearestStopDistanceM,
+          insideStopName: result.insideStopName,
+          insideState: result.insideState,
+          lastFilterReason: result.lastFilterReason,
+          expectedNextStopName: result.expectedNextStopName,
+        };
+      }
+
+      await saveActiveTripSession(mutableSession);
+      if (lastUpdate && tripUpdateListener) {
+        tripUpdateListener(lastUpdate);
+      }
+    } catch (taskError) {
+      await appendAuditLog({
+        scope: 'background-task',
+        type: 'exception',
+        message: taskError instanceof Error ? taskError.message : 'unknown error',
+      });
     }
   });
 }
@@ -292,6 +306,17 @@ async function persistLocationForSession(
     smoothedLat: smoothed.lat,
     smoothedLng: smoothed.lon,
     smoothedSpeedMps: smoothed.speedMps,
+  });
+  await appendAuditLog({
+    scope: 'gps-write',
+    trip_id: session.tripId,
+    ts: position.timestamp,
+    lat: coords.latitude,
+    lon: coords.longitude,
+    accuracy_m: coords.accuracy ?? null,
+    speed_mps: computedSpeed,
+    is_filtered: filter.isFiltered ? 1 : 0,
+    filter_reason: filter.reason,
   });
 
   const legacyDetection = evaluateStopDetection(session.detectorState, legacyStops, {

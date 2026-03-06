@@ -15,6 +15,14 @@ function fmt(value: number | null, digits = 1): string {
   return value.toFixed(digits);
 }
 
+function formatElapsed(totalSeconds: number): string {
+  const seconds = Math.max(0, totalSeconds);
+  const hh = Math.floor(seconds / 3600);
+  const mm = Math.floor((seconds % 3600) / 60);
+  const ss = seconds % 60;
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+}
+
 const speedHistory: number[] = [];
 const accuracyHistory: number[] = [];
 
@@ -45,7 +53,7 @@ export function DashboardScreen() {
       </GlassCard>
 
       <View style={styles.row}>
-        <MetricTile label="Elapsed" value={`${state.elapsedSeconds}s`} />
+        <MetricTile label="Elapsed" value={formatElapsed(state.elapsedSeconds)} />
         <MetricTile label="Distance" value={`${fmt(state.totalDistanceM, 0)} m`} />
       </View>
       <View style={styles.row}>
