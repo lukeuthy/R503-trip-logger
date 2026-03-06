@@ -56,13 +56,25 @@ export function setTripUpdateListener(listener: TripUpdateListener | null): void
 }
 
 export async function ensureBackgroundLocationReady(): Promise<void> {
-  const fg = await Location.requestForegroundPermissionsAsync();
+  let fg = await Location.getForegroundPermissionsAsync();
   if (fg.status !== 'granted') {
+    fg = await Location.requestForegroundPermissionsAsync();
+  }
+  if (fg.status !== 'granted') {
+    if (fg.canAskAgain === false) {
+      throw new Error('Foreground location is blocked. Enable Location permission in Android app settings.');
+    }
     throw new Error('Foreground location permission denied.');
   }
 
-  const bg = await Location.requestBackgroundPermissionsAsync();
+  let bg = await Location.getBackgroundPermissionsAsync();
   if (bg.status !== 'granted') {
+    bg = await Location.requestBackgroundPermissionsAsync();
+  }
+  if (bg.status !== 'granted') {
+    if (bg.canAskAgain === false) {
+      throw new Error('Background location is blocked. Set location access to "Allow all the time" in Android app settings.');
+    }
     throw new Error('Background location permission denied. Set "Allow all the time" in app settings.');
   }
 
