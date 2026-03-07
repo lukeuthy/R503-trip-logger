@@ -4,6 +4,14 @@ import {
   startBackgroundTracking,
   stopBackgroundTracking,
 } from '../../../trip/backgroundLocationTask';
+import { SENSING_CONFIG } from '../../utils/experimentConfig';
+
+export function getTrackerIntervals(): { samplingIntervalMs: number; fastestIntervalMs: number } {
+  return {
+    samplingIntervalMs: SENSING_CONFIG.samplingIntervalMs,
+    fastestIntervalMs: SENSING_CONFIG.fastestIntervalMs,
+  };
+}
 
 export async function ensureTrackerReady(): Promise<void> {
   await ensureBackgroundLocationReady();

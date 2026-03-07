@@ -4,7 +4,7 @@ import { R503_STOPS } from '../data/r503_stops';
 import { CREATE_SCHEMA_STATEMENTS, CREATE_V1_TABLE_STATEMENTS } from './schema';
 
 const LEGACY_SCHEMA_VERSION = 3;
-const V1_SCHEMA_VERSION = 4;
+const V1_SCHEMA_VERSION = 5;
 
 const DEFAULT_ROUTE_ID = 'route_r503';
 const DEFAULT_RADIUS_M = 40;
@@ -44,6 +44,10 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'gps_points', 'derived_heading_deg', 'ALTER TABLE gps_points ADD COLUMN derived_heading_deg REAL;');
   await ensureColumn(db, 'gps_points', 'provider_speed_mps', 'ALTER TABLE gps_points ADD COLUMN provider_speed_mps REAL;');
   await ensureColumn(db, 'gps_points', 'provider_heading_deg', 'ALTER TABLE gps_points ADD COLUMN provider_heading_deg REAL;');
+  await ensureColumn(db, 'trip_sessions', 'experiment_variant', 'ALTER TABLE trip_sessions ADD COLUMN experiment_variant TEXT;');
+  await ensureColumn(db, 'trip_sessions', 'battery_start_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_start_pct INTEGER;');
+  await ensureColumn(db, 'trip_sessions', 'battery_end_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_end_pct INTEGER;');
+  await ensureColumn(db, 'trip_sessions', 'battery_drain_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_drain_pct INTEGER;');
 }
 
 async function ensureColumn(

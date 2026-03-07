@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import * as Battery from 'expo-battery';
 
 import { getDb } from '../database/db';
 import type { GPSPointRow } from '../models/GPSPoint';
@@ -23,12 +24,15 @@ import {
 } from './backgroundLocationTask';
 import { createInitialStopDetectorState, getStopDetectionConfig, type StopInfo } from './stopDetector';
 import {
+  flushPointBuffer,
   insertSessionMetadata,
   loadTrackingHealth,
   loadTripDebug,
   markSessionEnded,
   resolveVariantId,
+  updateTripBatteryMetrics,
 } from '../src/db/queries';
+import { SENSING_CONFIG, VARIANT } from '../src/utils/experimentConfig';
 
 const APP_VERSION = '1.0.0-v1.0';
 const MAX_LOG_LINES = 40;
@@ -124,6 +128,7 @@ class TripController {
   private stops: StopInfo[] = [];
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
   private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private batteryStartPct: number | null = null;
 
   constructor() {
     setTripUpdateListener((update) => {
@@ -197,6 +202,14 @@ class TripController {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         startTimestampMs: startedAtMs,
       });
+      const batteryStartLevel = await Battery.getBatteryLevelAsync();
+      this.batteryStartPct = Number.isFinite(batteryStartLevel) ? Math.round(batteryStartLevel * 100) : null;
+      await updateTripBatteryMetrics({
+        tripId,
+        batteryStartPct: this.batteryStartPct,
+        batteryEndPct: null,
+        batteryDrainPct: null,
+      });
 
       const session: ActiveTripSession = {
         tripId,
@@ -268,6 +281,7 @@ class TripController {
 
       const message = getErrorMessage(error);
       this.stopElapsedTimer();
+      this.batteryStartPct = null;
       this.setState({
         status: 'idle',
         isBusy: false,
@@ -293,6 +307,7 @@ class TripController {
 
     try {
       await stopBackgroundTracking();
+      await flushPointBuffer();
 
       const db = await getDb();
       const endedAtMs = Date.now();
@@ -302,6 +317,19 @@ class TripController {
         this.state.tripId,
       ]);
       await markSessionEnded(this.state.tripId, endedAtMs);
+      const batteryEndLevel = await Battery.getBatteryLevelAsync();
+      const batteryEndPct = Number.isFinite(batteryEndLevel) ? Math.round(batteryEndLevel * 100) : null;
+      const batteryDrainPct =
+        this.batteryStartPct != null && batteryEndPct != null ? Math.max(0, this.batteryStartPct - batteryEndPct) : null;
+      await updateTripBatteryMetrics({
+        tripId: this.state.tripId,
+        batteryStartPct: this.batteryStartPct,
+        batteryEndPct,
+        batteryDrainPct,
+      });
+      this.appendLog(
+        `Battery drain (${SENSING_CONFIG.label}/${VARIANT}): start=${this.batteryStartPct ?? '-'} end=${batteryEndPct ?? '-'} drain=${batteryDrainPct ?? '-'}pp`,
+      );
       await clearActiveTripSession();
 
       this.stopElapsedTimer();
@@ -311,6 +339,7 @@ class TripController {
         status: 'stopped',
         isBusy: false,
       });
+      this.batteryStartPct = null;
       this.appendLog(`Trip stopped: ${this.state.tripId}`);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -328,6 +357,7 @@ class TripController {
     this.appendLog('Exporting trip JSON...');
 
     try {
+      await flushPointBuffer();
       const db = await getDb();
       const tripId = this.state.tripId;
 

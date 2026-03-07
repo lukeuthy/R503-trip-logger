@@ -1,4 +1,5 @@
 import * as FileSystem from 'expo-file-system/legacy';
+import { VARIANT } from './experimentConfig';
 
 export interface AppSettings {
   deviceId: string | null;
@@ -7,6 +8,8 @@ export interface AppSettings {
   smoothingAlpha: number;
   enterRadiusM: number;
   exitRadiusM: number;
+  experimentVariant: string;
+  taskRestartCount: number;
 }
 
 const SETTINGS_FILE = 'trip_logger_settings.json';
@@ -18,6 +21,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   smoothingAlpha: 0.25,
   enterRadiusM: 40,
   exitRadiusM: 60,
+  experimentVariant: VARIANT,
+  taskRestartCount: 0,
 };
 
 function getSettingsPath(): string {
@@ -55,4 +60,10 @@ export async function saveSettings(nextPatch: Partial<AppSettings>): Promise<App
   const path = getSettingsPath();
   await FileSystem.writeAsStringAsync(path, JSON.stringify(next));
   return next;
+}
+
+export async function incrementTaskRestartCount(): Promise<number> {
+  const current = await loadSettings();
+  const next = await saveSettings({ taskRestartCount: (current.taskRestartCount ?? 0) + 1, experimentVariant: VARIANT });
+  return next.taskRestartCount;
 }

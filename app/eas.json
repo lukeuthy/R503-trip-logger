@@ -13,6 +13,38 @@
         "buildType": "apk"
       }
     },
+    "exp-high": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPERIMENT_VARIANT": "high"
+      }
+    },
+    "exp-medium": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPERIMENT_VARIANT": "medium"
+      }
+    },
+    "exp-low": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPERIMENT_VARIANT": "low"
+      }
+    },
+    "exp-bg-degraded": {
+      "android": {
+        "buildType": "apk"
+      },
+      "env": {
+        "EXPERIMENT_VARIANT": "bg-degraded"
+      }
+    },
     "production": {
       "autoIncrement": true
     }

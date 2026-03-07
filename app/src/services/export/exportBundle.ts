@@ -1,7 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
 
 import { getDb } from '../../../database/db';
-import { loadExportMetadata } from '../../db/queries';
+import { SENSING_CONFIG, VARIANT } from '../../utils/experimentConfig';
+import { flushPointBuffer, loadExportMetadata } from '../../db/queries';
 import { getAuditFilePath } from '../location/fileAudit';
 
 export interface ExportBundleResult {
@@ -11,6 +12,7 @@ export interface ExportBundleResult {
 }
 
 export async function exportTripBundle(tripId: string): Promise<ExportBundleResult> {
+  await flushPointBuffer();
   const db = await getDb();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const baseDir = FileSystem.cacheDirectory;
@@ -46,6 +48,15 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
       app_version: metadata.appVersion,
       device_id: metadata.deviceId,
       route_variant: metadata.variantId,
+      experimentVariant: metadata.experimentVariant ?? VARIANT,
+      sensingLabel: SENSING_CONFIG.label,
+      samplingIntervalMs: SENSING_CONFIG.samplingIntervalMs,
+      writeBufferSize: SENSING_CONFIG.writeBufferSize,
+      geofenceRadiusM: SENSING_CONFIG.geofenceRadiusM,
+      useForegroundService: SENSING_CONFIG.useForegroundService,
+      batteryStartPct: metadata.batteryStartPct,
+      batteryEndPct: metadata.batteryEndPct,
+      batteryDrainPct: metadata.batteryDrainPct,
       exported_at: new Date().toISOString(),
       files: ['trip_sessions.csv', 'gps_points.csv', 'stop_events.csv', 'segment_times.csv', 'tracking_audit.log'],
     },

@@ -91,6 +91,10 @@ export const CREATE_V1_TABLE_STATEMENTS: string[] = [
     app_version TEXT NOT NULL,
     time_bucket TEXT NOT NULL,
     notes TEXT,
+    experiment_variant TEXT,
+    battery_start_pct INTEGER,
+    battery_end_pct INTEGER,
+    battery_drain_pct INTEGER,
     FOREIGN KEY(device_id) REFERENCES devices(device_id),
     FOREIGN KEY(variant_id) REFERENCES route_variants(variant_id)
   );`,

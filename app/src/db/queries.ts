@@ -4,6 +4,7 @@ import { getDb } from '../../database/db';
 import { deriveSegments } from '../services/location/segmentBuilder';
 import type { RouteStop, StopDetectionState } from '../services/location/stopDetector';
 import { appendAuditLog } from '../services/location/fileAudit';
+import { SENSING_CONFIG, VARIANT } from '../utils/experimentConfig';
 import { createUuidV4 } from '../utils/id';
 import { loadSettings, saveSettings } from '../utils/settingsStore';
 import type { DirectionCode, WindowCode } from '../../models/Trip';
@@ -36,6 +37,9 @@ export interface PersistPointInput {
   smoothedLng: number | null;
   smoothedSpeedMps: number | null;
 }
+
+let pointWriteBuffer: PersistPointInput[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
 export interface PersistStopEventInput {
   tripId: string;
@@ -95,9 +99,9 @@ export async function insertSessionMetadata(input: SessionMetadataInput): Promis
 
   await db.runAsync(
     `INSERT OR IGNORE INTO trip_sessions
-      (trip_id, device_id, variant_id, started_at, ended_at, timezone, app_version, time_bucket, notes)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL);`,
-    [input.tripId, deviceId, variantId, startedAtIso, input.timezone, input.appVersion, timeBucket],
+      (trip_id, device_id, variant_id, started_at, ended_at, timezone, app_version, time_bucket, notes, experiment_variant)
+     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?);`,
+    [input.tripId, deviceId, variantId, startedAtIso, input.timezone, input.appVersion, timeBucket, VARIANT],
   );
 }
 
@@ -118,7 +122,35 @@ export async function loadStopsForVariant(variantId: string): Promise<RouteStop[
 }
 
 export async function persistPoint(input: PersistPointInput): Promise<void> {
+  pointWriteBuffer.push(input);
+  if (pointWriteBuffer.length >= Math.max(1, SENSING_CONFIG.writeBufferSize)) {
+    await flushPointBuffer();
+    return;
+  }
+  if (SENSING_CONFIG.writeBufferTimeoutMs > 0 && !flushTimer) {
+    flushTimer = setTimeout(() => {
+      void flushPointBuffer();
+    }, SENSING_CONFIG.writeBufferTimeoutMs);
+  }
+}
+
+export async function flushPointBuffer(): Promise<void> {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  if (pointWriteBuffer.length === 0) {
+    return;
+  }
+  const batch = [...pointWriteBuffer];
+  pointWriteBuffer = [];
   const db = await getDb();
+  for (const point of batch) {
+    await insertPointNow(db, point);
+  }
+}
+
+async function insertPointNow(db: Awaited<ReturnType<typeof getDb>>, input: PersistPointInput): Promise<void> {
   const pointId = createUuidV4();
   await db.runAsync(
     `INSERT INTO gps_points
@@ -143,6 +175,28 @@ export async function persistPoint(input: PersistPointInput): Promise<void> {
       input.smoothedLat,
       input.smoothedLng,
       input.smoothedSpeedMps,
+    ],
+  );
+}
+
+export async function updateTripBatteryMetrics(input: {
+  tripId: string;
+  batteryStartPct: number | null;
+  batteryEndPct: number | null;
+  batteryDrainPct: number | null;
+}): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    `UPDATE trip_sessions
+     SET battery_start_pct = COALESCE(?, battery_start_pct),
+         battery_end_pct = COALESCE(?, battery_end_pct),
+         battery_drain_pct = COALESCE(?, battery_drain_pct)
+     WHERE trip_id = ?;`,
+    [
+      input.batteryStartPct,
+      input.batteryEndPct,
+      input.batteryDrainPct,
+      input.tripId,
     ],
   );
 }
@@ -211,6 +265,7 @@ export async function persistStopEvent(input: PersistStopEventInput): Promise<bo
 }
 
 export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
+  await flushPointBuffer();
   const db = await getDb();
   const stopOrders = await db.getAllAsync<{ stop_id: string; stop_order: number }>(
     `SELECT s.stop_id, s.stop_order
@@ -379,6 +434,10 @@ export async function loadExportMetadata(tripId: string): Promise<{
   appVersion: string;
   deviceId: string;
   variantId: string;
+  experimentVariant: string | null;
+  batteryStartPct: number | null;
+  batteryEndPct: number | null;
+  batteryDrainPct: number | null;
 }> {
   const db = await getDb();
   const schema = await db.getFirstAsync<{ schema_version: number }>('SELECT schema_version FROM schema_meta LIMIT 1;');
@@ -386,11 +445,22 @@ export async function loadExportMetadata(tripId: string): Promise<{
     app_version: string;
     device_id: string;
     variant_id: string;
-  }>('SELECT app_version, device_id, variant_id FROM trip_sessions WHERE trip_id = ?;', [tripId]);
+    experiment_variant: string | null;
+    battery_start_pct: number | null;
+    battery_end_pct: number | null;
+    battery_drain_pct: number | null;
+  }>(
+    'SELECT app_version, device_id, variant_id, experiment_variant, battery_start_pct, battery_end_pct, battery_drain_pct FROM trip_sessions WHERE trip_id = ?;',
+    [tripId],
+  );
   return {
     schemaVersion: schema?.schema_version ?? 0,
     appVersion: session?.app_version ?? 'unknown',
     deviceId: session?.device_id ?? 'unknown',
     variantId: session?.variant_id ?? 'unknown',
+    experimentVariant: session?.experiment_variant ?? null,
+    batteryStartPct: session?.battery_start_pct ?? null,
+    batteryEndPct: session?.battery_end_pct ?? null,
+    batteryDrainPct: session?.battery_drain_pct ?? null,
   };
 }

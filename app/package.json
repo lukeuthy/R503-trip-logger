@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "expo": "~55.0.4",
+    "expo-battery": "~55.0.8",
+    "expo-constants": "~55.0.7",
     "expo-dev-client": "~55.0.11",
     "expo-file-system": "~55.0.4",
     "expo-location": "~55.0.4",

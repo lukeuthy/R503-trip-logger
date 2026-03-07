@@ -3,6 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text } from 'react-native';
 import { tripController } from '../../trip/TripController';
 import { GlassCard } from '../components/GlassCard';
 import { colors, spacing } from '../theme/tokens';
+import { SENSING_CONFIG, VARIANT } from '../utils/experimentConfig';
 import { useTripState } from './useTripState';
 
 export function SettingsScreen() {
@@ -13,6 +14,7 @@ export function SettingsScreen() {
       <GlassCard>
         <Text style={styles.title}>Settings</Text>
         <Text style={styles.sub}>Tracking quality and diagnostics controls.</Text>
+        <Text style={styles.variant}>Build: {SENSING_CONFIG.label} ({VARIANT})</Text>
       </GlassCard>
 
       <Pressable
@@ -79,5 +81,10 @@ const styles = StyleSheet.create({
   debug: {
     color: colors.text,
     marginBottom: 4,
+  },
+  variant: {
+    color: '#9ca3af',
+    marginTop: 6,
+    fontSize: 11,
   },
 });

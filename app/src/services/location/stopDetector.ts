@@ -1,4 +1,5 @@
 import { haversineMeters } from './filters';
+import { SENSING_CONFIG } from '../../utils/experimentConfig';
 
 export interface RouteStop {
   stopId: string;
@@ -44,11 +45,11 @@ export interface StopDetectionOutput {
 }
 
 export const DEFAULT_STOP_CONFIG: StopDetectionConfig = {
-  enterRadiusM: 40,
-  exitRadiusM: 60,
+  enterRadiusM: SENSING_CONFIG.geofenceRadiusM,
+  exitRadiusM: SENSING_CONFIG.departureRadiusM,
   arriveSpeedMps: 3,
   departSpeedMps: 5,
-  dwellMs: 10_000,
+  dwellMs: SENSING_CONFIG.dwellTimeMs,
   departSpeedHoldMs: 5_000,
 };
 

@@ -19,7 +19,9 @@ import {
   type RouteStop,
 } from '../src/services/location/stopDetector';
 import { appendAuditLog } from '../src/services/location/fileAudit';
+import { SENSING_CONFIG, VARIANT } from '../src/utils/experimentConfig';
 import { loadSettings } from '../src/utils/settingsStore';
+import { incrementTaskRestartCount } from '../src/utils/settingsStore';
 import { calculateSpeedMps } from './speedCalculator';
 import type { ActiveTripSession, PersistedFix } from './activeTripStore';
 import { loadActiveTripSession, saveActiveTripSession } from './activeTripStore';
@@ -95,17 +97,20 @@ export async function startBackgroundTracking(): Promise<void> {
     return;
   }
 
-  await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, {
+  const locationOptions: Location.LocationTaskOptions = {
     accuracy: Location.Accuracy.Balanced,
-    timeInterval: 2000,
+    timeInterval: SENSING_CONFIG.samplingIntervalMs,
     distanceInterval: 5,
     pausesUpdatesAutomatically: false,
-    foregroundService: {
+  };
+  if (SENSING_CONFIG.useForegroundService) {
+    locationOptions.foregroundService = {
       notificationTitle: 'R503 logger running',
       notificationBody: 'Trip recording in background.',
       notificationColor: '#0f766e',
-    },
-  });
+    };
+  }
+  await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, locationOptions);
 }
 
 export async function stopBackgroundTracking(): Promise<void> {
@@ -117,8 +122,12 @@ export async function stopBackgroundTracking(): Promise<void> {
 }
 
 if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
+  void incrementTaskRestartCount();
   TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{ locations?: Location.LocationObject[] }>) => {
     try {
+      if (!SENSING_CONFIG.useForegroundService) {
+        console.warn(`[EXP:${VARIANT}] Running WITHOUT foreground service assertion (bg-degraded mode).`);
+      }
       const { data, error } = taskBody;
       if (error) {
         await appendAuditLog({
@@ -412,7 +421,7 @@ async function persistLocationForSession(
         activeStopId: null,
         events: [],
       }
-    : evaluateSequencedStopDetection(
+      : evaluateSequencedStopDetection(
         session.v1StopState ?? createInitialStopDetectionState(),
         v1Stops,
         {
@@ -422,11 +431,7 @@ async function persistLocationForSession(
           speedMps: movementSpeedMps,
           accuracyM: coords.accuracy ?? null,
         },
-        {
-          ...DEFAULT_STOP_CONFIG,
-          enterRadiusM: settings.enterRadiusM,
-          exitRadiusM: settings.exitRadiusM,
-        },
+        DEFAULT_STOP_CONFIG,
       );
 
   let insertedEvents = 0;
