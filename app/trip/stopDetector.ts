@@ -21,7 +21,7 @@ export interface StopDetectorState {
 
 export interface DetectedStopEvent {
   stop_id: number;
-  event_type: 'ENTER' | 'EXIT' | 'DWELL_CONFIRMED';
+  event_type: 'arrive' | 'depart' | 'dwell';
   timestamp_ms: number;
   dist_m: number;
   lat: number | null;
@@ -95,7 +95,7 @@ export function evaluateStopDetection(
   if (state.currentStopId != null && activeDistanceM != null && activeDistanceM >= EXIT_DISTANCE_M) {
     events.push({
       stop_id: state.currentStopId,
-      event_type: 'EXIT',
+      event_type: 'depart',
       timestamp_ms: current.timestampMs,
       dist_m: activeDistanceM,
       lat: current.lat,
@@ -112,7 +112,7 @@ export function evaluateStopDetection(
     nextState.dwellConfirmedStopId = null;
     events.push({
       stop_id: nearestStop.stop_id,
-      event_type: 'ENTER',
+      event_type: 'arrive',
       timestamp_ms: current.timestampMs,
       dist_m: nearestDistanceM,
       lat: current.lat,
@@ -133,7 +133,7 @@ export function evaluateStopDetection(
           nextState.dwellConfirmedStopId = insideStop.stop_id;
           events.push({
             stop_id: insideStop.stop_id,
-            event_type: 'DWELL_CONFIRMED',
+            event_type: 'dwell',
             timestamp_ms: current.timestampMs,
             dist_m: insideDistanceM,
             lat: current.lat,

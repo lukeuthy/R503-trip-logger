@@ -12,6 +12,7 @@ export interface SegmentInputPoint {
   lon: number;
   speedMps: number | null;
   accuracyM: number | null;
+  isFiltered: boolean;
 }
 
 export interface DerivedSegment {
@@ -24,6 +25,11 @@ export interface DerivedSegment {
   avgSpeedMps: number | null;
   p95SpeedMps: number | null;
   meanAccuracyM: number | null;
+  qualityFlag: 'good' | 'degraded' | 'poor';
+  pointCount: number;
+  maxGapSec: number | null;
+  p95AccuracyM: number | null;
+  minAccuracyM: number | null;
 }
 
 export interface SegmentDerivationMeta {
@@ -112,11 +118,22 @@ export function deriveSegments(
     const windowPoints = orderedPoints.filter(
       (point) => point.timestampMs >= pendingDepart!.timestampMs && point.timestampMs <= event.timestampMs,
     );
-    const distanceM = getPolylineDistance(windowPoints);
-    const speedValues = windowPoints.map((point) => point.speedMps).filter((value): value is number => value != null);
-    const accuracyValues = windowPoints
+    const validPoints = windowPoints.filter((point) => !point.isFiltered);
+    const distanceM = getPolylineDistance(validPoints);
+    const speedValues = validPoints.map((point) => point.speedMps).filter((value): value is number => value != null);
+    const accuracyValues = validPoints
       .map((point) => point.accuracyM)
       .filter((value): value is number => value != null && Number.isFinite(value));
+    const pointCount = validPoints.length;
+    const maxGapSec = getMaxGapSec(validPoints);
+    const meanAccuracy = mean(accuracyValues);
+    const p95Accuracy = percentile(accuracyValues, 95);
+    const minAccuracy = min(accuracyValues);
+    const qualityFlag = getQualityFlag({
+      pointCount,
+      maxGapSec,
+      meanAccuracyM: meanAccuracy,
+    });
 
     segments.push({
       fromStopId: pendingDepart.stopId,
@@ -127,7 +144,12 @@ export function deriveSegments(
       distanceM,
       avgSpeedMps: mean(speedValues),
       p95SpeedMps: percentile(speedValues, 95),
-      meanAccuracyM: mean(accuracyValues),
+      meanAccuracyM: meanAccuracy,
+      qualityFlag,
+      pointCount,
+      maxGapSec,
+      p95AccuracyM: p95Accuracy,
+      minAccuracyM: minAccuracy,
     });
     pendingDepart = null;
   }
@@ -169,4 +191,41 @@ function percentile(values: number[], percentileRank: number): number | null {
   const sorted = [...values].sort((a, b) => a - b);
   const index = Math.floor((percentileRank / 100) * (sorted.length - 1));
   return sorted[index] ?? null;
+}
+
+function min(values: number[]): number | null {
+  if (values.length === 0) {
+    return null;
+  }
+  return Math.min(...values);
+}
+
+function getMaxGapSec(points: SegmentInputPoint[]): number | null {
+  if (points.length < 2) {
+    return null;
+  }
+  let maxGapMs = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    maxGapMs = Math.max(maxGapMs, points[i].timestampMs - points[i - 1].timestampMs);
+  }
+  return maxGapMs / 1000;
+}
+
+function getQualityFlag(input: { pointCount: number; maxGapSec: number | null; meanAccuracyM: number | null }): 'good' | 'degraded' | 'poor' {
+  if (input.pointCount < 3) {
+    return 'poor';
+  }
+  if ((input.maxGapSec ?? 0) > 30) {
+    return 'poor';
+  }
+  if ((input.meanAccuracyM ?? 999) > 80) {
+    return 'poor';
+  }
+  if ((input.maxGapSec ?? 0) > 15) {
+    return 'degraded';
+  }
+  if ((input.meanAccuracyM ?? 999) >= 40) {
+    return 'degraded';
+  }
+  return 'good';
 }

@@ -1,4 +1,4 @@
-export type StopEventType = 'ENTER' | 'EXIT' | 'DWELL_CONFIRMED';
+export type StopEventType = 'arrive' | 'depart' | 'dwell';
 
 export interface StopEventRow {
   id: number;

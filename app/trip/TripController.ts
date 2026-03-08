@@ -31,6 +31,7 @@ import {
   markSessionEnded,
   resolveVariantId,
   updateTripBatteryMetrics,
+  updateTripTaskRestartCount,
 } from '../src/db/queries';
 import { SENSING_CONFIG, VARIANT } from '../src/utils/experimentConfig';
 
@@ -129,6 +130,7 @@ class TripController {
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private batteryStartPct: number | null = null;
+  private taskRestartStartCount = 0;
 
   constructor() {
     setTripUpdateListener((update) => {
@@ -201,7 +203,9 @@ class TripController {
         appVersion: APP_VERSION,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         startTimestampMs: startedAtMs,
+        taskRestartCount: (await loadSettings()).taskRestartCount ?? 0,
       });
+      this.taskRestartStartCount = (await loadSettings()).taskRestartCount ?? 0;
       const batteryStartLevel = await Battery.getBatteryLevelAsync();
       this.batteryStartPct = Number.isFinite(batteryStartLevel) ? Math.round(batteryStartLevel * 100) : null;
       await updateTripBatteryMetrics({
@@ -321,14 +325,17 @@ class TripController {
       const batteryEndPct = Number.isFinite(batteryEndLevel) ? Math.round(batteryEndLevel * 100) : null;
       const batteryDrainPct =
         this.batteryStartPct != null && batteryEndPct != null ? Math.max(0, this.batteryStartPct - batteryEndPct) : null;
+      const taskRestartEndCount = (await loadSettings()).taskRestartCount ?? this.taskRestartStartCount;
+      const taskRestartDelta = Math.max(0, taskRestartEndCount - this.taskRestartStartCount);
       await updateTripBatteryMetrics({
         tripId: this.state.tripId,
         batteryStartPct: this.batteryStartPct,
         batteryEndPct,
         batteryDrainPct,
       });
+      await updateTripTaskRestartCount(this.state.tripId, taskRestartDelta);
       this.appendLog(
-        `Battery drain (${SENSING_CONFIG.label}/${VARIANT}): start=${this.batteryStartPct ?? '-'} end=${batteryEndPct ?? '-'} drain=${batteryDrainPct ?? '-'}pp`,
+        `Battery drain (${SENSING_CONFIG.label}/${VARIANT}): start=${this.batteryStartPct ?? '-'} end=${batteryEndPct ?? '-'} drain=${batteryDrainPct ?? '-'}pp; task_restarts=${taskRestartDelta}`,
       );
       await clearActiveTripSession();
 
@@ -340,6 +347,7 @@ class TripController {
         isBusy: false,
       });
       this.batteryStartPct = null;
+      this.taskRestartStartCount = 0;
       this.appendLog(`Trip stopped: ${this.state.tripId}`);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -374,6 +382,14 @@ class TripController {
         'SELECT * FROM stop_event WHERE trip_id = ? ORDER BY timestamp_ms ASC;',
         [tripId],
       );
+      const segmentTimes = await db.getAllAsync<Record<string, unknown>>(
+        'SELECT * FROM segment_times WHERE trip_id = ? ORDER BY start_ts ASC;',
+        [tripId],
+      );
+      const tripSessions = await db.getAllAsync<Record<string, unknown>>(
+        'SELECT * FROM trip_sessions WHERE trip_id = ?;',
+        [tripId],
+      );
       const stops = await db.getAllAsync<StopInfo>(
         'SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code FROM stop ORDER BY stop_sequence ASC;',
       );
@@ -382,6 +398,8 @@ class TripController {
         trip,
         gps_points: gpsPoints,
         stop_events: stopEvents,
+        segment_times: segmentTimes,
+        trip_sessions: tripSessions,
         stops,
         config: {
           route_number: 'R503',

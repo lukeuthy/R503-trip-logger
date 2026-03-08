@@ -16,6 +16,7 @@ export interface SessionMetadataInput {
   appVersion: string;
   timezone: string;
   startTimestampMs: number;
+  taskRestartCount?: number | null;
 }
 
 export interface PersistPointInput {
@@ -99,9 +100,9 @@ export async function insertSessionMetadata(input: SessionMetadataInput): Promis
 
   await db.runAsync(
     `INSERT OR IGNORE INTO trip_sessions
-      (trip_id, device_id, variant_id, started_at, ended_at, timezone, app_version, time_bucket, notes, experiment_variant)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?);`,
-    [input.tripId, deviceId, variantId, startedAtIso, input.timezone, input.appVersion, timeBucket, VARIANT],
+      (trip_id, device_id, variant_id, started_at, ended_at, timezone, app_version, time_bucket, notes, experiment_variant, task_restart_count)
+     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?);`,
+    [input.tripId, deviceId, variantId, startedAtIso, input.timezone, input.appVersion, timeBucket, VARIANT, input.taskRestartCount ?? null],
   );
 }
 
@@ -201,6 +202,11 @@ export async function updateTripBatteryMetrics(input: {
   );
 }
 
+export async function updateTripTaskRestartCount(tripId: string, taskRestartCount: number): Promise<void> {
+  const db = await getDb();
+  await db.runAsync('UPDATE trip_sessions SET task_restart_count = ? WHERE trip_id = ?;', [taskRestartCount, tripId]);
+}
+
 export async function persistStopEvent(input: PersistStopEventInput): Promise<boolean> {
   const db = await getDb();
   const lastForStop = await db.getFirstAsync<{ event_type: 'arrive' | 'depart'; ts: string }>(
@@ -290,7 +296,8 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
     lng: number;
     speed_mps: number | null;
     accuracy_m: number | null;
-  }>('SELECT ts, lat, lng, speed_mps, accuracy_m FROM gps_points WHERE trip_id = ? ORDER BY ts ASC;', [tripId]);
+    is_filtered: number;
+  }>('SELECT ts, lat, lng, speed_mps, accuracy_m, is_filtered FROM gps_points WHERE trip_id = ? ORDER BY ts ASC;', [tripId]);
 
   const derivedResult = deriveSegments(
     events.map((event) => ({
@@ -304,6 +311,7 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
       lon: point.lng,
       speedMps: point.speed_mps,
       accuracyM: point.accuracy_m,
+      isFiltered: (point.is_filtered ?? 0) === 1,
     })),
     stopOrderByStopId,
   );
@@ -313,8 +321,8 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
   for (const segment of derived) {
     await db.runAsync(
       `INSERT INTO segment_times
-        (segment_id, trip_id, from_stop_id, to_stop_id, start_ts, end_ts, travel_time_sec, distance_m, avg_speed_mps, p95_speed_mps, mean_accuracy_m)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+        (segment_id, trip_id, from_stop_id, to_stop_id, start_ts, end_ts, travel_time_sec, distance_m, avg_speed_mps, p95_speed_mps, mean_accuracy_m, quality_flag, point_count, max_gap_sec, p95_accuracy_m, min_accuracy_m)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
       [
         createUuidV4(),
         tripId,
@@ -327,6 +335,11 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
         segment.avgSpeedMps,
         segment.p95SpeedMps,
         segment.meanAccuracyM,
+        segment.qualityFlag,
+        segment.pointCount,
+        segment.maxGapSec,
+        segment.p95AccuracyM,
+        segment.minAccuracyM,
       ],
     );
     await appendAuditLog({
@@ -435,6 +448,7 @@ export async function loadExportMetadata(tripId: string): Promise<{
   deviceId: string;
   variantId: string;
   experimentVariant: string | null;
+  taskRestartCount: number | null;
   batteryStartPct: number | null;
   batteryEndPct: number | null;
   batteryDrainPct: number | null;
@@ -446,11 +460,12 @@ export async function loadExportMetadata(tripId: string): Promise<{
     device_id: string;
     variant_id: string;
     experiment_variant: string | null;
+    task_restart_count: number | null;
     battery_start_pct: number | null;
     battery_end_pct: number | null;
     battery_drain_pct: number | null;
   }>(
-    'SELECT app_version, device_id, variant_id, experiment_variant, battery_start_pct, battery_end_pct, battery_drain_pct FROM trip_sessions WHERE trip_id = ?;',
+    'SELECT app_version, device_id, variant_id, experiment_variant, task_restart_count, battery_start_pct, battery_end_pct, battery_drain_pct FROM trip_sessions WHERE trip_id = ?;',
     [tripId],
   );
   return {
@@ -459,6 +474,7 @@ export async function loadExportMetadata(tripId: string): Promise<{
     deviceId: session?.device_id ?? 'unknown',
     variantId: session?.variant_id ?? 'unknown',
     experimentVariant: session?.experiment_variant ?? null,
+    taskRestartCount: session?.task_restart_count ?? null,
     batteryStartPct: session?.battery_start_pct ?? null,
     batteryEndPct: session?.battery_end_pct ?? null,
     batteryDrainPct: session?.battery_drain_pct ?? null,

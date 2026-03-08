@@ -4,7 +4,7 @@ import { R503_STOPS } from '../data/r503_stops';
 import { CREATE_SCHEMA_STATEMENTS, CREATE_V1_TABLE_STATEMENTS } from './schema';
 
 const LEGACY_SCHEMA_VERSION = 3;
-const V1_SCHEMA_VERSION = 5;
+const V1_SCHEMA_VERSION = 6;
 
 const DEFAULT_ROUTE_ID = 'route_r503';
 const DEFAULT_RADIUS_M = 40;
@@ -45,9 +45,15 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'gps_points', 'provider_speed_mps', 'ALTER TABLE gps_points ADD COLUMN provider_speed_mps REAL;');
   await ensureColumn(db, 'gps_points', 'provider_heading_deg', 'ALTER TABLE gps_points ADD COLUMN provider_heading_deg REAL;');
   await ensureColumn(db, 'trip_sessions', 'experiment_variant', 'ALTER TABLE trip_sessions ADD COLUMN experiment_variant TEXT;');
+  await ensureColumn(db, 'trip_sessions', 'task_restart_count', 'ALTER TABLE trip_sessions ADD COLUMN task_restart_count INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'battery_start_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_start_pct INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'battery_end_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_end_pct INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'battery_drain_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_drain_pct INTEGER;');
+  await ensureColumn(db, 'segment_times', 'quality_flag', 'ALTER TABLE segment_times ADD COLUMN quality_flag TEXT;');
+  await ensureColumn(db, 'segment_times', 'point_count', 'ALTER TABLE segment_times ADD COLUMN point_count INTEGER;');
+  await ensureColumn(db, 'segment_times', 'max_gap_sec', 'ALTER TABLE segment_times ADD COLUMN max_gap_sec REAL;');
+  await ensureColumn(db, 'segment_times', 'p95_accuracy_m', 'ALTER TABLE segment_times ADD COLUMN p95_accuracy_m REAL;');
+  await ensureColumn(db, 'segment_times', 'min_accuracy_m', 'ALTER TABLE segment_times ADD COLUMN min_accuracy_m REAL;');
 }
 
 async function ensureColumn(
