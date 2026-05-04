@@ -136,11 +136,40 @@ segment_id,trip_id,from_stop_id,to_stop_id,start_ts,end_ts,travel_time_sec,dista
 
 ## Run and verify locally
 
+This app should be run in a development build or standalone APK, not Expo Go. Expo Go QR codes are unreliable for this project because the app depends on Android background location / foreground service behavior and native configuration generated at build time.
+
 ```bash
 cd app
 npm install
 npm run typecheck
-npx expo start
+npm run start:dev
+```
+
+After installing a development build on the phone, scan the QR from `npm run start:dev` with the installed R503 Logger development app. Do not scan it with Expo Go.
+
+If you only need to inspect the UI in Expo Go, you can try:
+
+```bash
+cd app
+npm run start:go
+```
+
+Expo Go should not be used for actual trip collection.
+
+### First-time development build
+
+Use this once per native config change, then keep using `npm run start:dev` for JavaScript changes:
+
+```bash
+cd app
+npx expo run:android
+```
+
+If LAN QR scanning fails, start Metro in tunnel mode:
+
+```bash
+cd app
+npx expo start --dev-client --tunnel
 ```
 
 ## Build APK (standalone, no Metro at runtime)

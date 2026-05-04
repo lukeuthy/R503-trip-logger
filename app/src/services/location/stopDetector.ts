@@ -138,7 +138,8 @@ export function evaluateSequencedStopDetection(
       const activeDistM = haversineMeters(point.lat, point.lon, activeStop.lat, activeStop.lng);
       const highSpeed = (point.speedMps ?? 0) > config.departSpeedMps;
 
-      if (highSpeed) {
+      const outsideExitRadius = activeDistM >= config.exitRadiusM;
+      if (highSpeed || outsideExitRadius) {
         if (next.departCandidateSinceMs == null) {
           next.departCandidateSinceMs = point.timestampMs;
         }
@@ -149,7 +150,7 @@ export function evaluateSequencedStopDetection(
       const speedHeldLongEnough =
         next.departCandidateSinceMs != null && point.timestampMs - next.departCandidateSinceMs >= config.departSpeedHoldMs;
 
-      if (activeDistM >= config.exitRadiusM || speedHeldLongEnough) {
+      if (speedHeldLongEnough) {
         events.push({
           stopId: activeStop.stopId,
           eventType: 'depart',

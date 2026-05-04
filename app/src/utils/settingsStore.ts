@@ -10,6 +10,7 @@ export interface AppSettings {
   exitRadiusM: number;
   experimentVariant: string;
   taskRestartCount: number;
+  batteryOptimizationPrompted: boolean;
 }
 
 const SETTINGS_FILE = 'trip_logger_settings.json';
@@ -23,6 +24,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   exitRadiusM: 60,
   experimentVariant: VARIANT,
   taskRestartCount: 0,
+  batteryOptimizationPrompted: false,
 };
 
 function getSettingsPath(): string {

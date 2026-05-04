@@ -1,9 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Battery from 'expo-battery';
+import { AppState, type AppStateStatus } from 'react-native';
 
 import { getDb } from '../database/db';
-import type { GPSPointRow } from '../models/GPSPoint';
-import type { StopEventRow } from '../models/StopEvent';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
 import { exportTripBundle } from '../src/services/export/exportBundle';
 import { haversineMeters } from '../src/services/location/filters';
@@ -19,6 +18,7 @@ import {
   isBackgroundTrackingRunning,
   setTripUpdateListener,
   startBackgroundTracking,
+  restartBackgroundTracking,
   stopBackgroundTracking,
   type BackgroundTripUpdate,
 } from './backgroundLocationTask';
@@ -31,8 +31,8 @@ import {
   markSessionEnded,
   resolveVariantId,
   updateTripBatteryMetrics,
-  updateTripTaskRestartCount,
 } from '../src/db/queries';
+import { isIgnoringBatteryOptimizations, requestIgnoreBatteryOptimizations } from '../src/services/android/batteryOptimization';
 import { SENSING_CONFIG, VARIANT } from '../src/utils/experimentConfig';
 
 const APP_VERSION = '1.0.0-v1.0';
@@ -131,10 +131,16 @@ class TripController {
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private batteryStartPct: number | null = null;
   private taskRestartStartCount = 0;
+  private appState: AppStateStatus = AppState.currentState;
+  private backgroundedAtMs: number | null = null;
+  private lastResubscribeAtMs = 0;
 
   constructor() {
     setTripUpdateListener((update) => {
       this.handleBackgroundTripUpdate(update);
+    });
+    AppState.addEventListener('change', (nextState) => {
+      void this.handleAppStateChange(nextState);
     });
     void this.bootstrap();
   }
@@ -203,9 +209,9 @@ class TripController {
         appVersion: APP_VERSION,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         startTimestampMs: startedAtMs,
-        taskRestartCount: (await loadSettings()).taskRestartCount ?? 0,
+        taskRestartCount: 0,
       });
-      this.taskRestartStartCount = (await loadSettings()).taskRestartCount ?? 0;
+      this.taskRestartStartCount = 0;
       const batteryStartLevel = await Battery.getBatteryLevelAsync();
       this.batteryStartPct = Number.isFinite(batteryStartLevel) ? Math.round(batteryStartLevel * 100) : null;
       await updateTripBatteryMetrics({
@@ -228,6 +234,7 @@ class TripController {
       };
       await saveActiveTripSession(session);
 
+      await this.requestBatteryWhitelistIfNeeded();
       await ensureBackgroundLocationReady();
       await startBackgroundTracking();
 
@@ -323,19 +330,26 @@ class TripController {
       await markSessionEnded(this.state.tripId, endedAtMs);
       const batteryEndLevel = await Battery.getBatteryLevelAsync();
       const batteryEndPct = Number.isFinite(batteryEndLevel) ? Math.round(batteryEndLevel * 100) : null;
+      const storedBattery = await db.getFirstAsync<{ battery_start_pct: number | null }>(
+        'SELECT battery_start_pct FROM trip_sessions WHERE trip_id = ?;',
+        [this.state.tripId],
+      );
+      const batteryStartPct = this.batteryStartPct ?? storedBattery?.battery_start_pct ?? null;
       const batteryDrainPct =
-        this.batteryStartPct != null && batteryEndPct != null ? Math.max(0, this.batteryStartPct - batteryEndPct) : null;
-      const taskRestartEndCount = (await loadSettings()).taskRestartCount ?? this.taskRestartStartCount;
-      const taskRestartDelta = Math.max(0, taskRestartEndCount - this.taskRestartStartCount);
+        batteryStartPct != null && batteryEndPct != null ? Math.max(0, batteryStartPct - batteryEndPct) : null;
+      const restartRow = await db.getFirstAsync<{ task_restart_count: number | null }>(
+        'SELECT task_restart_count FROM trip_sessions WHERE trip_id = ?;',
+        [this.state.tripId],
+      );
+      const taskRestartCount = restartRow?.task_restart_count ?? 0;
       await updateTripBatteryMetrics({
         tripId: this.state.tripId,
-        batteryStartPct: this.batteryStartPct,
+        batteryStartPct,
         batteryEndPct,
         batteryDrainPct,
       });
-      await updateTripTaskRestartCount(this.state.tripId, taskRestartDelta);
       this.appendLog(
-        `Battery drain (${SENSING_CONFIG.label}/${VARIANT}): start=${this.batteryStartPct ?? '-'} end=${batteryEndPct ?? '-'} drain=${batteryDrainPct ?? '-'}pp; task_restarts=${taskRestartDelta}`,
+        `Battery drain (${SENSING_CONFIG.label}/${VARIANT}): start=${batteryStartPct ?? '-'} end=${batteryEndPct ?? '-'} drain=${batteryDrainPct ?? '-'}pp; task_restarts=${taskRestartCount}`,
       );
       await clearActiveTripSession();
 
@@ -374,24 +388,27 @@ class TripController {
         throw new Error('Trip not found for export.');
       }
 
-      const gpsPoints = await db.getAllAsync<GPSPointRow>(
-        'SELECT * FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms ASC;',
-        [tripId],
+      const canonicalTripId = trip.trip_id;
+
+      const gpsPointRows = await db.getAllAsync<Record<string, unknown>>(
+        'SELECT * FROM gps_points WHERE trip_id = ? ORDER BY timestamp_ms ASC;',
+        [canonicalTripId],
       );
-      const stopEvents = await db.getAllAsync<StopEventRow>(
-        'SELECT * FROM stop_event WHERE trip_id = ? ORDER BY timestamp_ms ASC;',
-        [tripId],
+      const gpsPoints = gpsPointRows.map(normalizeGpsPointRow);
+      const stopEvents = await db.getAllAsync<Record<string, unknown>>(
+        'SELECT * FROM stop_events WHERE trip_id = ? ORDER BY timestamp_ms ASC;',
+        [canonicalTripId],
       );
       const segmentTimes = await db.getAllAsync<Record<string, unknown>>(
         'SELECT * FROM segment_times WHERE trip_id = ? ORDER BY start_ts ASC;',
-        [tripId],
+        [canonicalTripId],
       );
       const tripSessions = await db.getAllAsync<Record<string, unknown>>(
         'SELECT * FROM trip_sessions WHERE trip_id = ?;',
-        [tripId],
+        [canonicalTripId],
       );
-      const stops = await db.getAllAsync<StopInfo>(
-        'SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code FROM stop ORDER BY stop_sequence ASC;',
+      const stops = await db.getAllAsync<Record<string, unknown>>(
+        'SELECT * FROM stops ORDER BY variant_id ASC, stop_order ASC;',
       );
 
       const payload = {
@@ -412,7 +429,7 @@ class TripController {
         throw new Error('documentDirectory is unavailable.');
       }
 
-      const safeTripId = tripId.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const safeTripId = canonicalTripId.replace(/[^a-zA-Z0-9_-]/g, '_');
       const outputPath = `${baseDir}r503_trip_${safeTripId}.json`;
       await FileSystem.writeAsStringAsync(outputPath, JSON.stringify(payload, null, 2));
 
@@ -494,6 +511,7 @@ class TripController {
 
   private async bootstrap(): Promise<void> {
     try {
+      await getDb();
       const settings = await loadSettings();
       this.setState({
         chartsMode: settings.chartsMode,
@@ -561,6 +579,59 @@ class TripController {
     }
   }
 
+  private async requestBatteryWhitelistIfNeeded(): Promise<void> {
+    try {
+      const settings = await loadSettings();
+      if (settings.batteryOptimizationPrompted) {
+        return;
+      }
+      await saveSettings({ batteryOptimizationPrompted: true });
+      const ignoring = await isIgnoringBatteryOptimizations();
+      if (ignoring) {
+        return;
+      }
+      const granted = await requestIgnoreBatteryOptimizations();
+      this.appendLog(granted ? 'Battery optimization whitelist confirmed.' : 'Battery optimization whitelist not granted.');
+    } catch (error) {
+      this.appendLog(`Battery optimization prompt warning: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private async handleAppStateChange(nextState: AppStateStatus): Promise<void> {
+    const previousState = this.appState;
+    this.appState = nextState;
+
+    if (nextState === 'background' || nextState === 'inactive') {
+      this.backgroundedAtMs = Date.now();
+      return;
+    }
+
+    if (nextState !== 'active' || previousState === 'active' || this.state.status !== 'recording') {
+      return;
+    }
+
+    const backgroundDurationMs = this.backgroundedAtMs == null ? null : Date.now() - this.backgroundedAtMs;
+    if (backgroundDurationMs == null || backgroundDurationMs < 60_000) {
+      return;
+    }
+
+    await this.resubscribeBackgroundTracking('foreground-resume');
+  }
+
+  private async resubscribeBackgroundTracking(reason: string): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastResubscribeAtMs < 30_000) {
+      return;
+    }
+    this.lastResubscribeAtMs = now;
+    try {
+      await restartBackgroundTracking();
+      this.appendLog(`Background GPS re-subscribed (${reason}).`);
+    } catch (error) {
+      this.appendLog(`GPS re-subscribe warning (${reason}): ${getErrorMessage(error)}`);
+    }
+  }
+
   private async loadTripSnapshot(tripId: string): Promise<{
     pointsCount: number;
     eventsCount: number;
@@ -571,8 +642,8 @@ class TripController {
   }> {
     const db = await getDb();
 
-    const pointsRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM gps_point WHERE trip_id = ?;', [tripId]);
-    const eventsRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM stop_event WHERE trip_id = ?;', [tripId]);
+    const pointsRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM gps_points WHERE trip_id = ?;', [tripId]);
+    const eventsRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM stop_events WHERE trip_id = ?;', [tripId]);
     const segmentRow = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM segment_times WHERE trip_id = ?;', [tripId]);
     const latestRow = await db.getFirstAsync<{
       timestamp_ms: number;
@@ -582,16 +653,16 @@ class TripController {
       speed_mps: number | null;
       heading_deg: number | null;
     }>(
-      'SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1;',
+      'SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg FROM gps_points WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1;',
       [tripId],
     );
     const firstRow = await db.getFirstAsync<{ timestamp_ms: number }>(
-      'SELECT timestamp_ms FROM gps_point WHERE trip_id = ? ORDER BY timestamp_ms ASC LIMIT 1;',
+      'SELECT timestamp_ms FROM gps_points WHERE trip_id = ? ORDER BY timestamp_ms ASC LIMIT 1;',
       [tripId],
     );
 
     const pathRows = await db.getAllAsync<{ lat: number; lon: number }>(
-      'SELECT lat, lon FROM gps_point WHERE trip_id = ? AND is_filtered = 0 ORDER BY timestamp_ms ASC;',
+      'SELECT lat, lon FROM gps_points WHERE trip_id = ? AND is_filtered = 0 ORDER BY timestamp_ms ASC;',
       [tripId],
     );
     let distance = 0;
@@ -772,6 +843,14 @@ class TripController {
         healthLastWriteIso: dbHealth.lastV1TsIso ?? (dbHealth.lastLegacyTsMs ? new Date(dbHealth.lastLegacyTsMs).toISOString() : null),
         healthAuditPath: audit.path,
       });
+      if (this.state.status === 'recording') {
+        const lastWriteMs = dbHealth.lastV1TsIso != null ? new Date(dbHealth.lastV1TsIso).getTime() : dbHealth.lastLegacyTsMs;
+        const staleMs = lastWriteMs != null && Number.isFinite(lastWriteMs) ? Date.now() - lastWriteMs : null;
+        const noPointYetMs = this.state.startedAtMs != null ? Date.now() - this.state.startedAtMs : null;
+        if ((staleMs != null && staleMs > 45_000) || (lastWriteMs == null && noPointYetMs != null && noPointYetMs > 45_000)) {
+          await this.resubscribeBackgroundTracking('gps-watchdog');
+        }
+      }
     } catch (error) {
       this.appendLog(`Health refresh warning: ${getErrorMessage(error)}`);
     }
@@ -783,6 +862,26 @@ function getErrorMessage(error: unknown): string {
     return error.message;
   }
   return 'Unknown error';
+}
+
+function normalizeGpsPointRow(row: Record<string, unknown>, index: number): Record<string, unknown> {
+  const ts = String(row.ts ?? '');
+  const tsMs = new Date(ts).getTime();
+  const timestampMs =
+    row.timestamp_ms != null && Number.isFinite(Number(row.timestamp_ms))
+      ? Number(row.timestamp_ms)
+      : Number.isFinite(tsMs)
+      ? tsMs
+      : null;
+
+  return {
+    ...row,
+    id: row.id ?? index + 1,
+    timestamp_ms: timestampMs,
+    lon: row.lon ?? row.lng ?? null,
+    heading_deg: row.heading_deg ?? row.bearing_deg ?? null,
+    smoothed_lon: row.smoothed_lon ?? row.smoothed_lng ?? null,
+  };
 }
 
 export const tripController = new TripController();

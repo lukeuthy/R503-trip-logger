@@ -40,8 +40,8 @@ const configs: Record<ExperimentVariant, SensingConfig> = {
   medium: {
     samplingIntervalMs: 5000,
     fastestIntervalMs: 3000,
-    writeBufferSize: 10,
-    writeBufferTimeoutMs: 30000,
+    writeBufferSize: 1,
+    writeBufferTimeoutMs: 0,
     geofenceRadiusM: 40,
     departureRadiusM: 60,
     dwellTimeMs: 5000,
