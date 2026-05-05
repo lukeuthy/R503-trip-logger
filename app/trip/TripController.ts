@@ -134,6 +134,7 @@ class TripController {
   private appState: AppStateStatus = AppState.currentState;
   private backgroundedAtMs: number | null = null;
   private lastResubscribeAtMs = 0;
+  private watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     setTripUpdateListener((update) => {
@@ -237,6 +238,9 @@ class TripController {
       await this.requestBatteryWhitelistIfNeeded();
       await ensureBackgroundLocationReady();
       await startBackgroundTracking();
+
+      // Start watchdog to detect silent GPS stoppage
+      this.startWatchdog(tripId);
 
       this.setState({
         status: 'recording',
@@ -355,6 +359,7 @@ class TripController {
 
       this.stopElapsedTimer();
       this.stopHealthTimer();
+      this.stopWatchdog();
       await this.refreshTrackingHealth();
       this.setState({
         status: 'stopped',
@@ -571,8 +576,10 @@ class TripController {
       if (!running) {
         await startBackgroundTracking();
         this.appendLog('Recovered trip and restarted background tracking.');
+        this.startWatchdog(session.tripId);
       } else {
         this.appendLog('Recovered active trip after app restart.');
+        this.startWatchdog(session.tripId);
       }
     } catch (error) {
       this.appendLog(`Recovery warning: ${getErrorMessage(error)}`);
@@ -786,6 +793,32 @@ class TripController {
     }
   }
 
+  private startWatchdog(tripId: string): void {
+    this.stopWatchdog();
+    this.watchdogTimer = setInterval(async () => {
+      try {
+        const db = await getDb();
+        const row = await db.getFirstAsync<{ timestamp_ms: number }>(
+          'SELECT timestamp_ms FROM gps_points WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1',
+          [tripId],
+        );
+        const gap = (Date.now() - (row?.timestamp_ms ?? 0)) / 1000;
+        if (gap > 60) {
+          await this.resubscribeBackgroundTracking('watchdog');
+        }
+      } catch {
+        // best-effort
+      }
+    }, 30000);
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
   private async safeBackgroundCleanup(): Promise<void> {
     try {
       await stopBackgroundTracking();
@@ -798,6 +831,7 @@ class TripController {
       // Best effort.
     }
     this.stopHealthTimer();
+    this.stopWatchdog();
   }
 
   private appendLog(message: string): void {

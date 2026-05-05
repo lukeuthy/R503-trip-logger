@@ -1,5 +1,6 @@
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import type { DirectionCode } from '../models/Trip';
@@ -125,6 +126,11 @@ export async function startBackgroundTracking(): Promise<void> {
   if (running) {
     return;
   }
+  try {
+    await activateKeepAwakeAsync('r503-gps');
+  } catch {
+    // best-effort
+  }
   await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
 }
 
@@ -138,6 +144,11 @@ export async function stopBackgroundTracking(): Promise<void> {
     return;
   }
   await Location.stopLocationUpdatesAsync(R503_BACKGROUND_TASK);
+  try {
+    deactivateKeepAwake('r503-gps');
+  } catch {
+    // best-effort
+  }
 }
 
 function getLocationTaskOptions(): Location.LocationTaskOptions {
@@ -164,6 +175,11 @@ async function resubscribeGPS(): Promise<void> {
   } catch {
     // Re-start below even if stop fails.
   }
+  try {
+    await activateKeepAwakeAsync('r503-gps');
+  } catch {
+    // best-effort
+  }
   await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
 }
 
@@ -171,6 +187,11 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
   TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{ locations?: Location.LocationObject[] }>) => {
     const session = await loadActiveTripSession();
     try {
+      try {
+        await activateKeepAwakeAsync('r503-gps');
+      } catch {
+        // best-effort
+      }
       if (taskBody.error) {
         if (session) {
           await incrementTripRestartCount(session.tripId);

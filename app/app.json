@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "R503 Logger (Testing)",
-    "slug": "r503-logger-testing",
-    "version": "1.0.0",
+    "name": "R503 Logger",
+    "slug": "r503-logger",
+    "version": "1.8.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
