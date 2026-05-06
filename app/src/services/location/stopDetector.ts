@@ -1,4 +1,5 @@
 import { haversineMeters } from './filters';
+import { SENSING_CONFIG } from '../../utils/experimentConfig';
 
 export interface RouteStop {
   stopId: string;
@@ -44,11 +45,11 @@ export interface StopDetectionOutput {
 }
 
 export const DEFAULT_STOP_CONFIG: StopDetectionConfig = {
-  enterRadiusM: 40,
-  exitRadiusM: 60,
+  enterRadiusM: SENSING_CONFIG.geofenceRadiusM,
+  exitRadiusM: SENSING_CONFIG.departureRadiusM,
   arriveSpeedMps: 3,
   departSpeedMps: 5,
-  dwellMs: 10_000,
+  dwellMs: SENSING_CONFIG.dwellTimeMs,
   departSpeedHoldMs: 5_000,
 };
 
@@ -137,7 +138,8 @@ export function evaluateSequencedStopDetection(
       const activeDistM = haversineMeters(point.lat, point.lon, activeStop.lat, activeStop.lng);
       const highSpeed = (point.speedMps ?? 0) > config.departSpeedMps;
 
-      if (highSpeed) {
+      const outsideExitRadius = activeDistM >= config.exitRadiusM;
+      if (highSpeed || outsideExitRadius) {
         if (next.departCandidateSinceMs == null) {
           next.departCandidateSinceMs = point.timestampMs;
         }
@@ -148,7 +150,7 @@ export function evaluateSequencedStopDetection(
       const speedHeldLongEnough =
         next.departCandidateSinceMs != null && point.timestampMs - next.departCandidateSinceMs >= config.departSpeedHoldMs;
 
-      if (activeDistM >= config.exitRadiusM || speedHeldLongEnough) {
+      if (speedHeldLongEnough) {
         events.push({
           stopId: activeStop.stopId,
           eventType: 'depart',

@@ -3,6 +3,7 @@ import { haversineMeters } from './speedCalculator';
 const ENTER_DISTANCE_M = 35;
 const EXIT_DISTANCE_M = 60;
 const DWELL_MS = 10_000;
+const EXIT_DEBOUNCE_MS = 5_000;
 
 export interface StopInfo {
   stop_id: number;
@@ -17,11 +18,12 @@ export interface StopDetectorState {
   currentStopId: number | null;
   enteredAtMs: number | null;
   dwellConfirmedStopId: number | null;
+  exitCandidateSinceMs: number | null;
 }
 
 export interface DetectedStopEvent {
   stop_id: number;
-  event_type: 'ENTER' | 'EXIT' | 'DWELL_CONFIRMED';
+  event_type: 'arrive' | 'depart' | 'dwell';
   timestamp_ms: number;
   dist_m: number;
   lat: number | null;
@@ -54,6 +56,7 @@ export function createInitialStopDetectorState(): StopDetectorState {
     currentStopId: null,
     enteredAtMs: null,
     dwellConfirmedStopId: null,
+    exitCandidateSinceMs: null,
   };
 }
 
@@ -93,9 +96,22 @@ export function evaluateStopDetection(
   let insideStop: StopInfo | null = null;
 
   if (state.currentStopId != null && activeDistanceM != null && activeDistanceM >= EXIT_DISTANCE_M) {
+    if (nextState.exitCandidateSinceMs == null) {
+      nextState.exitCandidateSinceMs = current.timestampMs;
+    }
+  } else {
+    nextState.exitCandidateSinceMs = null;
+  }
+
+  if (
+    state.currentStopId != null &&
+    activeDistanceM != null &&
+    nextState.exitCandidateSinceMs != null &&
+    current.timestampMs - nextState.exitCandidateSinceMs >= EXIT_DEBOUNCE_MS
+  ) {
     events.push({
       stop_id: state.currentStopId,
-      event_type: 'EXIT',
+      event_type: 'depart',
       timestamp_ms: current.timestampMs,
       dist_m: activeDistanceM,
       lat: current.lat,
@@ -104,15 +120,17 @@ export function evaluateStopDetection(
     nextState.currentStopId = null;
     nextState.enteredAtMs = null;
     nextState.dwellConfirmedStopId = null;
+    nextState.exitCandidateSinceMs = null;
   }
 
   if (nearestDistanceM <= ENTER_DISTANCE_M && nearestStop.stop_id !== nextState.currentStopId) {
     nextState.currentStopId = nearestStop.stop_id;
     nextState.enteredAtMs = current.timestampMs;
     nextState.dwellConfirmedStopId = null;
+    nextState.exitCandidateSinceMs = null;
     events.push({
       stop_id: nearestStop.stop_id,
-      event_type: 'ENTER',
+      event_type: 'arrive',
       timestamp_ms: current.timestampMs,
       dist_m: nearestDistanceM,
       lat: current.lat,
@@ -133,7 +151,7 @@ export function evaluateStopDetection(
           nextState.dwellConfirmedStopId = insideStop.stop_id;
           events.push({
             stop_id: insideStop.stop_id,
-            event_type: 'DWELL_CONFIRMED',
+            event_type: 'dwell',
             timestamp_ms: current.timestampMs,
             dist_m: insideDistanceM,
             lat: current.lat,
