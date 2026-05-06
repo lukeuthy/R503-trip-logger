@@ -319,10 +319,8 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
     [tripId],
   );
   const stopOrderByStopId: Record<string, number> = {};
-  const stopIdByOrder: Record<number, string> = {};
   for (const row of stopOrders) {
     stopOrderByStopId[row.stop_id] = row.stop_order;
-    stopIdByOrder[row.stop_order] = row.stop_id;
   }
 
   const events = await db.getAllAsync<{
@@ -356,21 +354,53 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
 
   for (const exitEvent of exits) {
     const fromOrder = stopOrderByStopId[exitEvent.stopId];
-    const toStopId = fromOrder == null ? null : stopIdByOrder[fromOrder + 1] ?? null;
-    if (!toStopId) {
-      continue;
-    }
-    const arriveMs = arrivesByStopId.get(toStopId) ?? null;
-    if (arriveMs == null || arriveMs <= exitEvent.timestampMs) {
+    if (fromOrder == null) {
       continue;
     }
 
-    const segmentMetrics = await computeSegmentMetrics(db, tripId, exitEvent.timestampMs, arriveMs);
+    // Skip-stop aware: find the lowest-order stop ahead of this exit that has
+    // an arrive event. The original +1 lookup stalls when the bus skips a stop
+    // because arrivesByStopId never gets an entry for the skipped stop.
+    let toStopId: string | null = null;
+    let arriveMs: number | null = null;
+    let lowestAheadOrder = Infinity;
+
+    for (const [candidateStopId, candidateArriveMs] of arrivesByStopId) {
+      const candidateOrder = stopOrderByStopId[candidateStopId];
+      if (candidateOrder == null || candidateOrder <= fromOrder) continue;
+      if (candidateArriveMs <= exitEvent.timestampMs) continue;
+      if (candidateOrder < lowestAheadOrder) {
+        lowestAheadOrder = candidateOrder;
+        toStopId = candidateStopId;
+        arriveMs = candidateArriveMs;
+      }
+    }
+
+    if (!toStopId || arriveMs == null) {
+      continue;
+    }
+
+    // Dwell time at the departure stop (arrive → exit). Null when there is no
+    // recorded arrive for the from-stop (e.g. first stop of the trip).
+    const fromStopArriveMs = arrivesByStopId.get(exitEvent.stopId) ?? null;
+    const dwellTimeSec =
+      fromStopArriveMs != null && fromStopArriveMs < exitEvent.timestampMs
+        ? (exitEvent.timestampMs - fromStopArriveMs) / 1000
+        : null;
+
+    // Number of stops between from_stop and to_stop that were skipped.
+    const stopsSkipped = lowestAheadOrder - fromOrder - 1;
+
     const travelTimeS = (arriveMs - exitEvent.timestampMs) / 1000;
+    const segmentMetrics = await computeSegmentMetrics(db, tripId, exitEvent.timestampMs, arriveMs);
     await db.runAsync(
       `INSERT INTO segment_times
-        (segment_id, trip_id, from_stop_id, to_stop_id, depart_ms, arrive_ms, travel_time_s, start_ts, end_ts, travel_time_sec, distance_m, avg_speed_mps, p95_speed_mps, mean_accuracy_m, quality_flag, point_count, max_gap_sec, p95_accuracy_m, min_accuracy_m)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+        (segment_id, trip_id, from_stop_id, to_stop_id, depart_ms, arrive_ms,
+         travel_time_s, start_ts, end_ts, travel_time_sec, distance_m,
+         avg_speed_mps, p95_speed_mps, mean_accuracy_m, quality_flag,
+         point_count, max_gap_sec, p95_accuracy_m, min_accuracy_m,
+         dwell_time_sec, congestion_ratio, std_speed_mps, stops_skipped)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
       [
         createUuidV4(),
         tripId,
@@ -391,6 +421,10 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
         segmentMetrics.maxGapSec,
         segmentMetrics.p95AccuracyM,
         segmentMetrics.minAccuracyM,
+        dwellTimeSec,
+        segmentMetrics.congestionRatio,
+        segmentMetrics.stdSpeedMps,
+        stopsSkipped,
       ],
     );
     await appendAuditLog({
@@ -404,6 +438,9 @@ export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
     });
   }
 }
+
+// Speed below this threshold is considered "congested" (< ~10 km/h).
+const CONGESTION_SPEED_MPS = 3.0;
 
 async function computeSegmentMetrics(
   db: Awaited<ReturnType<typeof getDb>>,
@@ -420,6 +457,8 @@ async function computeSegmentMetrics(
   maxGapSec: number | null;
   p95AccuracyM: number | null;
   minAccuracyM: number | null;
+  congestionRatio: number | null;
+  stdSpeedMps: number | null;
 }> {
   const points = await db.getAllAsync<{
     timestamp_ms: number;
@@ -428,9 +467,12 @@ async function computeSegmentMetrics(
     lat: number;
     lon: number | null;
     speed_mps: number | null;
+    derived_speed_mps: number | null;
     accuracy_m: number | null;
   }>(
-    `SELECT timestamp_ms, smoothed_lat, smoothed_lon, lat, lon, speed_mps, accuracy_m
+    // derived_speed_mps is preferred over provider speed_mps: Android provider
+    // reports 0 at low bus speeds while the position-delta derived value is accurate.
+    `SELECT timestamp_ms, smoothed_lat, smoothed_lon, lat, lon, speed_mps, derived_speed_mps, accuracy_m
      FROM gps_points
      WHERE trip_id = ? AND is_filtered = 0 AND timestamp_ms >= ? AND timestamp_ms <= ?
      ORDER BY timestamp_ms ASC;`,
@@ -449,23 +491,45 @@ async function computeSegmentMetrics(
     );
   }
 
-  const speedValues = points.map((point) => point.speed_mps).filter((value): value is number => value != null);
-  const accuracyValues = points.map((point) => point.accuracy_m).filter((value): value is number => value != null);
-  const maxGapSec = getMaxGapSec(points.map((point) => point.timestamp_ms));
+  // Use derived speed where available; fall back to provider speed.
+  const effectiveSpeeds = points
+    .map((p) => p.derived_speed_mps ?? p.speed_mps)
+    .filter((v): v is number => v != null);
+  const accuracyValues = points
+    .map((p) => p.accuracy_m)
+    .filter((v): v is number => v != null && Number.isFinite(v));
+
+  const maxGapSec = getMaxGapSec(points.map((p) => p.timestamp_ms));
   const meanAccuracyM = mean(accuracyValues);
   const qualityFlag: 'good' | 'degraded' | 'poor' =
-    points.length < 3 || (maxGapSec ?? 0) > 60 ? 'poor' : (maxGapSec ?? 0) > 30 || (meanAccuracyM ?? 0) > 40 ? 'degraded' : 'good';
+    points.length < 3 || (maxGapSec ?? 0) > 60
+      ? 'poor'
+      : (maxGapSec ?? 0) > 30 || (meanAccuracyM ?? 0) > 40
+      ? 'degraded'
+      : 'good';
+
+  // Congestion ratio: fraction of valid points at crawl speed.
+  const congestionRatio =
+    effectiveSpeeds.length > 0
+      ? effectiveSpeeds.filter((v) => v < CONGESTION_SPEED_MPS).length / effectiveSpeeds.length
+      : null;
+
+  // Speed standard deviation using population formula.
+  const stdSpeedMps = stdDev(effectiveSpeeds);
 
   return {
     distanceM,
+    // Space mean speed (distance / time) is the correct average for ETA modelling.
     avgSpeedMps: points.length > 1 ? distanceM / Math.max(1, (arriveMs - departMs) / 1000) : null,
-    p95SpeedMps: percentile(speedValues, 95),
+    p95SpeedMps: percentile(effectiveSpeeds, 95),
     meanAccuracyM,
     qualityFlag,
     pointCount: points.length,
     maxGapSec,
     p95AccuracyM: percentile(accuracyValues, 95),
     minAccuracyM: accuracyValues.length > 0 ? Math.min(...accuracyValues) : null,
+    congestionRatio,
+    stdSpeedMps,
   };
 }
 
@@ -474,6 +538,15 @@ function mean(values: number[]): number | null {
     return null;
   }
   return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function stdDev(values: number[]): number | null {
+  if (values.length < 2) {
+    return null;
+  }
+  const avg = values.reduce((sum, v) => sum + v, 0) / values.length;
+  const variance = values.reduce((sum, v) => sum + (v - avg) ** 2, 0) / values.length;
+  return Math.sqrt(variance);
 }
 
 function percentile(values: number[], percentileRank: number): number | null {

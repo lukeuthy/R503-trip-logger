@@ -238,6 +238,12 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
       let lastUpdate: BackgroundTripUpdate | null = null;
 
       for (const location of [...locations].sort((a, b) => a.timestamp - b.timestamp)) {
+        // Discard GPS callbacks that fired before the trip was officially started.
+        // The background task may already be running from a previous session,
+        // so its first few callbacks can predate startedAtMs by several minutes.
+        if (location.timestamp < mutableSession.startedAtMs) {
+          continue;
+        }
         const point = await insertGPSPoint(mutableSession.tripId, location);
         pointsInserted += 1;
 
@@ -357,19 +363,26 @@ async function insertGPSPoint(tripId: string, location: Location.LocationObject)
   } else if (previousPoint && timestampMs < previousPoint.timestamp_ms) {
     isFiltered = true;
     filterReason = 'out-of-order-timestamp';
+  } else if (previousPoint && timestampMs - previousPoint.timestamp_ms > GAP_RESET_MS) {
+    // Gap check must come before cold_start so that the first point after a
+    // CPU-sleep blackout is tagged post-gap-reset (not cold_start_zero_values).
+    // This resets the EMA to the recovery position and allows the next valid
+    // point to compute derived_speed_mps from the correct baseline.
+    isFiltered = true;
+    filterReason = 'post-gap-reset';
   } else if (speedMps === 0 && headingDeg === 0) {
     isFiltered = true;
     filterReason = 'cold_start_zero_values';
   } else if (accuracyM != null && accuracyM > LOW_ACCURACY_M) {
     isFiltered = true;
     filterReason = 'low-accuracy';
-  } else if (previousPoint && timestampMs - previousPoint.timestamp_ms > GAP_RESET_MS) {
-    isFiltered = true;
-    filterReason = 'post-gap-reset';
   } else if (previousValidPoint) {
     const prevLon = previousValidPoint.lon ?? lon;
     const dtSec = (timestampMs - previousValidPoint.timestamp_ms) / 1000;
-    if (dtSec > 0) {
+    // Only compute derived fields when the time delta is plausible.
+    // A delta >= GAP_RESET_MS means the previousValidPoint is from before a
+    // blackout; the resulting near-zero speed would corrupt quality metrics.
+    if (dtSec > 0 && dtSec < GAP_RESET_MS / 1000) {
       derivedSpeedMps = haversineMeters(previousValidPoint.lat, prevLon, lat, lon) / dtSec;
       derivedHeadingDeg = deriveHeadingDeg({ lat: previousValidPoint.lat, lon: prevLon }, { lat, lon });
     }
@@ -464,7 +477,36 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
   }
 
   const nearest = getNearestStop(stops, point.smoothedLat, point.smoothedLon);
-  const target = await getTargetStop(tripId, stops);
+  let target = await getTargetStop(tripId, stops);
+
+  // Skip-stop: if the bus is within EXIT_DISTANCE_M of a stop that is ahead of the
+  // current target, the bus has passed the target without stopping. Mark the target
+  // as EXITED (skipped) and advance. Repeats if multiple stops were skipped.
+  if (target && nearest.stop && nearest.distanceM != null &&
+      nearest.stop.stopOrder > target.stopOrder &&
+      nearest.distanceM <= EXIT_DISTANCE_M) {
+    const db = await getDb();
+    const targetState = await loadStopState(tripId, target.stopId);
+    if (targetState.state !== 'ARRIVED' && targetState.state !== 'DWELLING') {
+      await db.runAsync(
+        `INSERT INTO stop_states (trip_id, stop_id, state, entered_at_ms, dwell_at_ms, exit_candidate_count, updated_at_ms)
+         VALUES (?, ?, 'EXITED', NULL, NULL, 0, ?)
+         ON CONFLICT(trip_id, stop_id) DO UPDATE SET
+           state = 'EXITED', updated_at_ms = excluded.updated_at_ms;`,
+        [tripId, target.stopId, point.timestampMs],
+      );
+      await appendAuditLog({
+        scope: 'stop-detection',
+        action: 'skip-stop-advanced',
+        trip_id: tripId,
+        stop_id: target.stopId,
+        ts: point.timestampMs,
+        message: `Skipped ${target.name}; nearest is ${nearest.stop.name} (order ${nearest.stop.stopOrder} > ${target.stopOrder})`,
+      });
+      target = await getTargetStop(tripId, stops);
+    }
+  }
+
   if (!target) {
     return {
       eventsInserted: 0,
