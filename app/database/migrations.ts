@@ -4,7 +4,7 @@ import { R503_STOPS } from '../data/r503_stops';
 import { CREATE_SCHEMA_STATEMENTS, CREATE_V1_TABLE_STATEMENTS } from './schema';
 
 const LEGACY_SCHEMA_VERSION = 3;
-const V1_SCHEMA_VERSION = 6;
+const V1_SCHEMA_VERSION = 7;
 
 const DEFAULT_ROUTE_ID = 'route_r503';
 const DEFAULT_RADIUS_M = 40;
@@ -141,6 +141,10 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'segment_times', 'depart_ms', 'ALTER TABLE segment_times ADD COLUMN depart_ms INTEGER;');
   await ensureColumn(db, 'segment_times', 'arrive_ms', 'ALTER TABLE segment_times ADD COLUMN arrive_ms INTEGER;');
   await ensureColumn(db, 'segment_times', 'travel_time_s', 'ALTER TABLE segment_times ADD COLUMN travel_time_s REAL;');
+  await ensureColumn(db, 'segment_times', 'dwell_time_sec', 'ALTER TABLE segment_times ADD COLUMN dwell_time_sec REAL;');
+  await ensureColumn(db, 'segment_times', 'congestion_ratio', 'ALTER TABLE segment_times ADD COLUMN congestion_ratio REAL;');
+  await ensureColumn(db, 'segment_times', 'std_speed_mps', 'ALTER TABLE segment_times ADD COLUMN std_speed_mps REAL;');
+  await ensureColumn(db, 'segment_times', 'stops_skipped', 'ALTER TABLE segment_times ADD COLUMN stops_skipped INTEGER NOT NULL DEFAULT 0;');
   await db.execAsync('CREATE INDEX IF NOT EXISTS idx_gps_points_trip_timestamp_ms ON gps_points(trip_id, timestamp_ms);');
   await db.execAsync('CREATE INDEX IF NOT EXISTS idx_stop_events_trip_timestamp_ms ON stop_events(trip_id, timestamp_ms);');
 }

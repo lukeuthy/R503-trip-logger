@@ -179,6 +179,10 @@ export const CREATE_V1_TABLE_STATEMENTS: string[] = [
     max_gap_sec REAL,
     p95_accuracy_m REAL,
     min_accuracy_m REAL,
+    dwell_time_sec REAL,
+    congestion_ratio REAL,
+    std_speed_mps REAL,
+    stops_skipped INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(trip_id) REFERENCES trip_sessions(trip_id),
     FOREIGN KEY(from_stop_id) REFERENCES stops(stop_id),
     FOREIGN KEY(to_stop_id) REFERENCES stops(stop_id)

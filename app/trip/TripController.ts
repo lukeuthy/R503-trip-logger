@@ -1,5 +1,6 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Battery from 'expo-battery';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { AppState, type AppStateStatus } from 'react-native';
 
 import { getDb } from '../database/db';
@@ -239,6 +240,18 @@ class TripController {
       await ensureBackgroundLocationReady();
       await startBackgroundTracking();
 
+      // Acquire a trip-scoped PARTIAL_WAKE_LOCK so the CPU stays alive for the
+      // entire recording session. Gated so the bg-degraded variant (no foreground
+      // service) remains deliberately unprotected for the experiment comparison.
+      if (SENSING_CONFIG.useForegroundService) {
+        try {
+          await activateKeepAwakeAsync('r503-active-trip');
+          this.appendLog('[WAKELOCK] Acquired');
+        } catch {
+          // best-effort; foreground service still runs without it
+        }
+      }
+
       // Start watchdog to detect silent GPS stoppage
       this.startWatchdog(tripId);
 
@@ -322,6 +335,12 @@ class TripController {
 
     try {
       await stopBackgroundTracking();
+      try {
+        deactivateKeepAwake('r503-active-trip');
+        this.appendLog('[WAKELOCK] Released');
+      } catch {
+        // best-effort
+      }
       await flushPointBuffer();
 
       const db = await getDb();
@@ -829,6 +848,11 @@ class TripController {
       await clearActiveTripSession();
     } catch {
       // Best effort.
+    }
+    try {
+      deactivateKeepAwake('r503-active-trip');
+    } catch {
+      // Best effort — safe to call even if no lock was acquired.
     }
     this.stopHealthTimer();
     this.stopWatchdog();
