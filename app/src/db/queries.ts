@@ -113,12 +113,22 @@ export async function markSessionEnded(tripId: string, endedAtMs: number): Promi
 
 export async function loadStopsForVariant(variantId: string): Promise<RouteStop[]> {
   const db = await getDb();
-  return db.getAllAsync<RouteStop>(
+  const rows = await db.getAllAsync<RouteStop>(
     `SELECT stop_id as stopId, stop_order as stopOrder, name, lat, lng, radius_m as radiusM
      FROM stops
      WHERE variant_id = ?
      ORDER BY stop_order ASC;`,
     [variantId],
+  );
+  if (rows.length > 0) {
+    return rows;
+  }
+  // Fallback: all stops regardless of variant (handles r503_pm trips where only
+  // r503_am stops are seeded in the DB, and new installs before data migration).
+  return db.getAllAsync<RouteStop>(
+    `SELECT stop_id as stopId, stop_order as stopOrder, name, lat, lng, radius_m as radiusM
+     FROM stops
+     ORDER BY stop_order ASC;`,
   );
 }
 

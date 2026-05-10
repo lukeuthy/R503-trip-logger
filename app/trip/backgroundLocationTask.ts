@@ -1,6 +1,5 @@
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
-import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import type { DirectionCode } from '../models/Trip';
@@ -15,13 +14,14 @@ import { deriveHeadingDeg, haversineMeters } from '../src/services/location/filt
 import type { RouteStop } from '../src/services/location/stopDetector';
 import { appendAuditLog } from '../src/services/location/fileAudit';
 import { loadActiveTripSession, saveActiveTripSession, type ActiveTripSession } from './activeTripStore';
+import { SENSING_CONFIG } from '../src/utils/experimentConfig';
 
 export const R503_BACKGROUND_TASK = 'R503_BACKGROUND_LOCATION_TASK';
 
-const GPS_INTERVAL_MS = 5000;
-const ENTER_DISTANCE_M = 35;
-const EXIT_DISTANCE_M = 60;
-const DWELL_MS = 8000;
+const GPS_INTERVAL_MS = SENSING_CONFIG.samplingIntervalMs;
+const ENTER_DISTANCE_M = SENSING_CONFIG.geofenceRadiusM;
+const EXIT_DISTANCE_M = SENSING_CONFIG.departureRadiusM;
+const DWELL_MS = SENSING_CONFIG.dwellTimeMs;
 const EXIT_CONSECUTIVE_POINTS = 3;
 const EMA_ALPHA = 0.3;
 const LOW_ACCURACY_M = 40;
@@ -48,6 +48,12 @@ export interface BackgroundTripUpdate {
   insideState: 'INSIDE' | 'OUTSIDE';
   lastFilterReason: string | null;
   expectedNextStopName: string | null;
+  /** Ms since last unfiltered GPS fix. Null if a valid fix was received this batch. */
+  gpsStaleMs: number | null;
+  /** How many consecutive filtered points have been received. Resets on valid fix. */
+  consecutiveFilteredCount: number;
+  /** Auto-detected direction code based on GPS movement. */
+  detectedDirectionCode: DirectionCode | null;
 }
 
 interface StoredGpsPoint {
@@ -89,6 +95,11 @@ interface StopStateRow {
 let tripUpdateListener: TripUpdateListener | null = null;
 const countedTaskRuntimeTripIds = new Set<string>();
 const taskRuntimeStartedAtMs = Date.now();
+// Per-trip caches that reset on module reload (i.e. after each JS-runtime restart).
+const seedingDoneForTripIds = new Set<string>();
+const detectedDirectionCache = new Map<string, DirectionCode>();
+const lastValidFixMsCache = new Map<string, number>();
+const consecutiveFilteredCache = new Map<string, number>();
 
 export function setTripUpdateListener(listener: TripUpdateListener | null): void {
   tripUpdateListener = listener;
@@ -126,16 +137,11 @@ export async function startBackgroundTracking(): Promise<void> {
   if (running) {
     return;
   }
-  try {
-    await activateKeepAwakeAsync('r503-gps');
-  } catch {
-    // best-effort
-  }
   await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
 }
 
-export async function restartBackgroundTracking(): Promise<void> {
-  await resubscribeGPS();
+export async function restartBackgroundTracking(notificationBody?: string): Promise<void> {
+  await resubscribeGPS(notificationBody);
 }
 
 export async function stopBackgroundTracking(): Promise<void> {
@@ -144,29 +150,27 @@ export async function stopBackgroundTracking(): Promise<void> {
     return;
   }
   await Location.stopLocationUpdatesAsync(R503_BACKGROUND_TASK);
-  try {
-    deactivateKeepAwake('r503-gps');
-  } catch {
-    // best-effort
-  }
 }
 
-function getLocationTaskOptions(): Location.LocationTaskOptions {
-  return {
+function getLocationTaskOptions(notificationBody?: string): Location.LocationTaskOptions {
+  const base: Location.LocationTaskOptions = {
     accuracy: Location.Accuracy.BestForNavigation,
     timeInterval: GPS_INTERVAL_MS,
     distanceInterval: 0,
     pausesUpdatesAutomatically: false,
     showsBackgroundLocationIndicator: true,
-    foregroundService: {
-      notificationTitle: 'R503 Logger',
-      notificationBody: 'Collecting GPS data',
-      killServiceOnDestroy: false,
-    } as Location.LocationTaskServiceOptions,
   };
+  if (SENSING_CONFIG.useForegroundService) {
+    base.foregroundService = {
+      notificationTitle: 'R503 Logger',
+      notificationBody: notificationBody ?? 'Collecting GPS data',
+      killServiceOnDestroy: false,
+    } as Location.LocationTaskServiceOptions;
+  }
+  return base;
 }
 
-async function resubscribeGPS(): Promise<void> {
+async function resubscribeGPS(notificationBody?: string): Promise<void> {
   try {
     const running = await isBackgroundTrackingRunning();
     if (running) {
@@ -175,23 +179,73 @@ async function resubscribeGPS(): Promise<void> {
   } catch {
     // Re-start below even if stop fails.
   }
-  try {
-    await activateKeepAwakeAsync('r503-gps');
-  } catch {
-    // best-effort
+  await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions(notificationBody));
+}
+
+/** Infer travel direction from longitude change between two valid fixes. */
+function inferDirectionFromMovement(prevLon: number, currLon: number): DirectionCode | null {
+  const dLon = currLon - prevLon;
+  // Require ~90 m of east-west movement (0.0008° ≈ 89 m at 7° N latitude).
+  if (Math.abs(dLon) < 0.0008) {
+    return null;
   }
-  await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
+  return dLon > 0 ? 'A' : 'B';
+}
+
+/**
+ * On the first valid GPS fix of a trip, mark all stops that precede the
+ * nearest stop (in the current ordered stop list) as EXITED so that
+ * getTargetStop begins at the right position rather than always at stop 1.
+ */
+async function seedStopStatesIfNeeded(
+  tripId: string,
+  orderedStops: RouteStop[],
+  point: InsertedGpsPoint,
+): Promise<void> {
+  const db = await getDb();
+  const existing = await db.getFirstAsync<{ count: number }>(
+    'SELECT COUNT(*) as count FROM stop_states WHERE trip_id = ?;',
+    [tripId],
+  );
+  // Already seeded (either this runtime or a previous one that ran for this trip).
+  if ((existing?.count ?? 0) > 0) {
+    seedingDoneForTripIds.add(tripId);
+    return;
+  }
+
+  const nearest = getNearestStop(orderedStops, point.smoothedLat, point.smoothedLon);
+  if (!nearest.stop) {
+    seedingDoneForTripIds.add(tripId);
+    return;
+  }
+
+  const nearestIdx = orderedStops.findIndex((s) => s.stopId === nearest.stop!.stopId);
+  const stopsToSkip = nearestIdx > 0 ? orderedStops.slice(0, nearestIdx) : [];
+
+  for (const stop of stopsToSkip) {
+    await db.runAsync(
+      `INSERT INTO stop_states (trip_id, stop_id, state, entered_at_ms, dwell_at_ms, exit_candidate_count, updated_at_ms)
+       VALUES (?, ?, 'EXITED', NULL, NULL, 0, ?)
+       ON CONFLICT(trip_id, stop_id) DO NOTHING;`,
+      [tripId, stop.stopId, point.timestampMs],
+    );
+  }
+
+  seedingDoneForTripIds.add(tripId);
+
+  await appendAuditLog({
+    scope: 'stop-detection',
+    action: 'adaptive-seed',
+    trip_id: tripId,
+    ts: point.timestampMs,
+    message: `Seeded ${stopsToSkip.length} past stop(s) EXITED; target starts at ${nearest.stop.name} (order ${nearest.stop.stopOrder})`,
+  });
 }
 
 if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
   TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{ locations?: Location.LocationObject[] }>) => {
     const session = await loadActiveTripSession();
     try {
-      try {
-        await activateKeepAwakeAsync('r503-gps');
-      } catch {
-        // best-effort
-      }
       if (taskBody.error) {
         if (session) {
           await incrementTripRestartCount(session.tripId);
@@ -232,6 +286,17 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
       const variantId = session.variantId ?? resolveVariantId(session.directionCode, session.windowCode);
       const stops = await loadStopsForVariant(variantId);
       let mutableSession: ActiveTripSession = { ...session, variantId };
+
+      // Restore or initialize the effective travel direction.
+      // Priority: in-memory cache > persisted detectedDirectionCode > user selection.
+      const effectiveDirection: DirectionCode =
+        detectedDirectionCache.get(session.tripId) ??
+        session.detectedDirectionCode ??
+        session.directionCode;
+      if (!detectedDirectionCache.has(session.tripId) && effectiveDirection !== session.directionCode) {
+        detectedDirectionCache.set(session.tripId, effectiveDirection);
+      }
+
       let pointsInserted = 0;
       let eventsInserted = 0;
       let segmentUpdates = 0;
@@ -247,6 +312,44 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
         const point = await insertGPSPoint(mutableSession.tripId, location);
         pointsInserted += 1;
 
+        // --- GPS health tracking ---
+        if (point.isFiltered) {
+          consecutiveFilteredCache.set(
+            mutableSession.tripId,
+            (consecutiveFilteredCache.get(mutableSession.tripId) ?? 0) + 1,
+          );
+        } else {
+          consecutiveFilteredCache.set(mutableSession.tripId, 0);
+          lastValidFixMsCache.set(mutableSession.tripId, point.timestampMs);
+
+          // Direction detection: infer from movement between saved fix and this point.
+          if (!detectedDirectionCache.has(mutableSession.tripId)) {
+            const refLon = mutableSession.lastFix?.lon ?? null;
+            if (refLon != null) {
+              const inferred = inferDirectionFromMovement(refLon, point.lon);
+              if (inferred) {
+                detectedDirectionCache.set(mutableSession.tripId, inferred);
+                if (inferred !== (mutableSession.detectedDirectionCode ?? session.directionCode)) {
+                  mutableSession = { ...mutableSession, detectedDirectionCode: inferred };
+                }
+              }
+            }
+          }
+
+          // Seed past stops on the first valid fix (skip-stops for mid-route start).
+          if (!seedingDoneForTripIds.has(mutableSession.tripId)) {
+            const seedDir = detectedDirectionCache.get(mutableSession.tripId) ?? effectiveDirection;
+            const seedOrderedStops =
+              seedDir === 'B' ? [...stops].sort((a, b) => b.stopOrder - a.stopOrder) : stops;
+            await seedStopStatesIfNeeded(mutableSession.tripId, seedOrderedStops, point);
+          }
+        }
+
+        // Build the stop list ordered by detected direction for this point.
+        const currentDir = detectedDirectionCache.get(mutableSession.tripId) ?? effectiveDirection;
+        const orderedStops =
+          currentDir === 'B' ? [...stops].sort((a, b) => b.stopOrder - a.stopOrder) : stops;
+
         let detection: StopDetectionResult = {
           eventsInserted: 0,
           segmentsUpdated: 0,
@@ -257,7 +360,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
           expectedNextStopName: null,
         };
         if (!point.isFiltered) {
-          detection = await runStopDetection(mutableSession.tripId, stops, point);
+          detection = await runStopDetection(mutableSession.tripId, orderedStops, point);
           eventsInserted += detection.eventsInserted;
           segmentUpdates += detection.segmentsUpdated;
         }
@@ -275,6 +378,11 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
             smoothedSpeedMps: point.smoothedSpeedMps,
           },
         };
+
+        const lastValidMs = lastValidFixMsCache.get(mutableSession.tripId);
+        const gpsStaleMs = lastValidMs != null ? Math.max(0, Date.now() - lastValidMs) : null;
+        const consecutiveFiltered = consecutiveFilteredCache.get(mutableSession.tripId) ?? 0;
+
         lastUpdate = {
           tripId: mutableSession.tripId,
           pointsInserted,
@@ -294,6 +402,9 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
           insideState: detection.insideState,
           lastFilterReason: point.filterReason,
           expectedNextStopName: detection.expectedNextStopName,
+          gpsStaleMs,
+          consecutiveFilteredCount: consecutiveFiltered,
+          detectedDirectionCode: detectedDirectionCache.get(mutableSession.tripId) ?? null,
         };
       }
 

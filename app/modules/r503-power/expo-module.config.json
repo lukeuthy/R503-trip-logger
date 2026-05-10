@@ -1,0 +1,9 @@
+{
+  "platforms": ["android", "ios"],
+  "android": {
+    "modules": ["com.r503.power.R503PowerModule"]
+  },
+  "ios": {
+    "modules": ["R503PowerModule"]
+  }
+}

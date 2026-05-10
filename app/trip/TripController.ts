@@ -1,7 +1,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Battery from 'expo-battery';
-import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
-import { AppState, type AppStateStatus } from 'react-native';
+import { acquireWakeLock, isWakeLockHeld, releaseWakeLock } from 'r503-power';
+import { AppState, PermissionsAndroid, Platform, type AppStateStatus } from 'react-native';
 
 import { getDb } from '../database/db';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
@@ -82,6 +82,14 @@ export interface UITripState {
   healthAuditLines: number;
   healthLastWriteIso: string | null;
   healthAuditPath: string | null;
+  /** Ms since last unfiltered GPS fix during active recording. */
+  gpsStaleMs: number | null;
+  /** Number of consecutive filtered points received. Resets on valid fix. */
+  consecutiveFilteredCount: number;
+  /** GPS health status derived from stale time. */
+  gpsHealthStatus: 'ok' | 'degraded' | 'offline';
+  /** Auto-detected direction code from GPS movement. */
+  detectedDirectionCode: DirectionCode | null;
   lastError: string | null;
   logs: string[];
 }
@@ -122,6 +130,10 @@ class TripController {
     healthAuditLines: 0,
     healthLastWriteIso: null,
     healthAuditPath: null,
+    gpsStaleMs: null,
+    consecutiveFilteredCount: 0,
+    gpsHealthStatus: 'ok',
+    detectedDirectionCode: null,
     lastError: null,
     logs: [],
   };
@@ -236,20 +248,17 @@ class TripController {
       };
       await saveActiveTripSession(session);
 
+      await this.requestNotificationPermissionIfNeeded();
       await this.requestBatteryWhitelistIfNeeded();
       await ensureBackgroundLocationReady();
       await startBackgroundTracking();
 
-      // Acquire a trip-scoped PARTIAL_WAKE_LOCK so the CPU stays alive for the
-      // entire recording session. Gated so the bg-degraded variant (no foreground
+      // Acquire a real PARTIAL_WAKE_LOCK so the CPU stays alive for the entire
+      // recording session. Gated so the bg-degraded variant (no foreground
       // service) remains deliberately unprotected for the experiment comparison.
       if (SENSING_CONFIG.useForegroundService) {
-        try {
-          await activateKeepAwakeAsync('r503-active-trip');
-          this.appendLog('[WAKELOCK] Acquired');
-        } catch {
-          // best-effort; foreground service still runs without it
-        }
+        const acquired = await acquireWakeLock('active-trip');
+        this.appendLog(acquired ? '[WAKELOCK] Acquired' : '[WAKELOCK] Acquire failed');
       }
 
       // Start watchdog to detect silent GPS stoppage
@@ -283,6 +292,10 @@ class TripController {
         healthAuditLines: 0,
         healthLastWriteIso: null,
         healthAuditPath: null,
+        gpsStaleMs: null,
+        consecutiveFilteredCount: 0,
+        gpsHealthStatus: 'ok',
+        detectedDirectionCode: null,
         lastError: null,
       });
 
@@ -335,12 +348,8 @@ class TripController {
 
     try {
       await stopBackgroundTracking();
-      try {
-        deactivateKeepAwake('r503-active-trip');
-        this.appendLog('[WAKELOCK] Released');
-      } catch {
-        // best-effort
-      }
+      const released = await releaseWakeLock();
+      this.appendLog(released ? '[WAKELOCK] Released' : '[WAKELOCK] Release failed');
       await flushPointBuffer();
 
       const db = await getDb();
@@ -595,31 +604,75 @@ class TripController {
       if (!running) {
         await startBackgroundTracking();
         this.appendLog('Recovered trip and restarted background tracking.');
-        this.startWatchdog(session.tripId);
       } else {
         this.appendLog('Recovered active trip after app restart.');
-        this.startWatchdog(session.tripId);
       }
+
+      // Re-acquire the trip-scoped wake lock. The previous JS process held it
+      // but the lock died with the process; without this the recovered trip
+      // runs unprotected and Doze can throttle GPS until the user manually
+      // stops/starts the trip.
+      if (SENSING_CONFIG.useForegroundService) {
+        const acquired = await acquireWakeLock('active-trip');
+        this.appendLog(acquired ? '[WAKELOCK] Re-acquired on recovery' : '[WAKELOCK] Recovery acquire failed');
+      }
+
+      this.startWatchdog(session.tripId);
     } catch (error) {
       this.appendLog(`Recovery warning: ${getErrorMessage(error)}`);
     }
   }
 
-  private async requestBatteryWhitelistIfNeeded(): Promise<void> {
+  private async requestNotificationPermissionIfNeeded(): Promise<void> {
+    // Android 13+ requires POST_NOTIFICATIONS at runtime. The foreground location
+    // service relies on a posted notification to stay alive — without it the OS
+    // (and Motorola's battery manager) will kill the service in seconds, which
+    // also kills GPS and our wake lock with it.
+    if (Platform.OS !== 'android' || (typeof Platform.Version === 'number' && Platform.Version < 33)) {
+      return;
+    }
     try {
-      const settings = await loadSettings();
-      if (settings.batteryOptimizationPrompted) {
+      const permission = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
+      const already = await PermissionsAndroid.check(permission);
+      if (already) {
+        this.appendLog('[NOTIF] Permission already granted.');
         return;
       }
-      await saveSettings({ batteryOptimizationPrompted: true });
+      const result = await PermissionsAndroid.request(permission);
+      if (result === PermissionsAndroid.RESULTS.GRANTED) {
+        this.appendLog('[NOTIF] Permission granted.');
+      } else if (result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN) {
+        this.appendLog('[NOTIF] Permission denied permanently — enable manually in Settings.');
+      } else {
+        this.appendLog('[NOTIF] Permission denied — foreground service will be unstable.');
+      }
+    } catch (error) {
+      this.appendLog(`[NOTIF] Permission request warning: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private async requestBatteryWhitelistIfNeeded(): Promise<void> {
+    // Always check the real OS state — older builds set batteryOptimizationPrompted=true
+    // even when the prompt never actually ran (the underlying native module was missing
+    // and silently reported "already whitelisted"). Re-prompt every trip start until the
+    // OS reports the app is genuinely on the ignore-optimizations allowlist.
+    try {
       const ignoring = await isIgnoringBatteryOptimizations();
       if (ignoring) {
+        await saveSettings({ batteryOptimizationPrompted: true });
+        this.appendLog('[BATTERY] Whitelist confirmed.');
         return;
       }
+      this.appendLog('[BATTERY] Not whitelisted — opening system prompt.');
       const granted = await requestIgnoreBatteryOptimizations();
-      this.appendLog(granted ? 'Battery optimization whitelist confirmed.' : 'Battery optimization whitelist not granted.');
+      if (granted) {
+        await saveSettings({ batteryOptimizationPrompted: true });
+        this.appendLog('[BATTERY] Whitelist prompt opened. Please grant Unrestricted.');
+      } else {
+        this.appendLog('[BATTERY] Whitelist prompt failed to open. Grant manually in Settings.');
+      }
     } catch (error) {
-      this.appendLog(`Battery optimization prompt warning: ${getErrorMessage(error)}`);
+      this.appendLog(`[BATTERY] Whitelist check warning: ${getErrorMessage(error)}`);
     }
   }
 
@@ -644,14 +697,14 @@ class TripController {
     await this.resubscribeBackgroundTracking('foreground-resume');
   }
 
-  private async resubscribeBackgroundTracking(reason: string): Promise<void> {
+  private async resubscribeBackgroundTracking(reason: string, notificationBody?: string): Promise<void> {
     const now = Date.now();
     if (now - this.lastResubscribeAtMs < 30_000) {
       return;
     }
     this.lastResubscribeAtMs = now;
     try {
-      await restartBackgroundTracking();
+      await restartBackgroundTracking(notificationBody);
       this.appendLog(`Background GPS re-subscribed (${reason}).`);
     } catch (error) {
       this.appendLog(`GPS re-subscribe warning (${reason}): ${getErrorMessage(error)}`);
@@ -734,6 +787,11 @@ class TripController {
       this.state.startedAtMs == null ? this.state.elapsedSeconds : Math.max(0, Math.floor((Date.now() - this.state.startedAtMs) / 1000));
     const avgSpeedMps = elapsedSeconds > 0 ? totalDistanceM / elapsedSeconds : null;
 
+    const staleMs = update.gpsStaleMs;
+    const gpsHealthStatus =
+      staleMs == null || staleMs < 30_000 ? 'ok' :
+      staleMs < 90_000 ? 'degraded' : 'offline';
+
     this.setState({
       pointsCount: this.state.pointsCount + update.pointsInserted,
       eventsCount: this.state.eventsCount + update.eventsInserted,
@@ -758,6 +816,10 @@ class TripController {
       expectedNextStopName: update.expectedNextStopName,
       insideState: update.insideState,
       lastFilterReason: update.lastFilterReason,
+      gpsStaleMs: staleMs,
+      consecutiveFilteredCount: update.consecutiveFilteredCount,
+      gpsHealthStatus,
+      detectedDirectionCode: update.detectedDirectionCode,
     });
     void this.refreshTrackingHealth();
   }
@@ -815,15 +877,39 @@ class TripController {
   private startWatchdog(tripId: string): void {
     this.stopWatchdog();
     this.watchdogTimer = setInterval(async () => {
+      // Wake lock health check — re-acquire immediately if dropped.
+      // A dropped lock is the primary cause of GPS blackouts: the CPU sleeps
+      // between callbacks even when the foreground service notification is up.
+      if (SENSING_CONFIG.useForegroundService) {
+        try {
+          const held = await isWakeLockHeld();
+          if (!held) {
+            const acquired = await acquireWakeLock('active-trip');
+            this.appendLog(
+              acquired
+                ? '[WAKELOCK] Dropped — re-acquired by watchdog'
+                : '[WAKELOCK] Dropped and watchdog acquire failed',
+            );
+            this.setState({ gpsHealthStatus: acquired ? 'degraded' : 'offline' });
+          }
+        } catch {
+          // best-effort
+        }
+      }
+
       try {
         const db = await getDb();
         const row = await db.getFirstAsync<{ timestamp_ms: number }>(
           'SELECT timestamp_ms FROM gps_points WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1',
           [tripId],
         );
-        const gap = (Date.now() - (row?.timestamp_ms ?? 0)) / 1000;
-        if (gap > 60) {
-          await this.resubscribeBackgroundTracking('watchdog');
+        const gapSec = (Date.now() - (row?.timestamp_ms ?? 0)) / 1000;
+        if (gapSec > 60) {
+          const gapStr = Math.round(gapSec);
+          const notifBody = `GPS gap ${gapStr}s — reconnecting`;
+          this.appendLog(`[GPS] Gap ${gapStr}s — resubscribing`);
+          this.setState({ gpsHealthStatus: gapSec > 90 ? 'offline' : 'degraded' });
+          await this.resubscribeBackgroundTracking('watchdog', notifBody);
         }
       } catch {
         // best-effort
@@ -849,11 +935,7 @@ class TripController {
     } catch {
       // Best effort.
     }
-    try {
-      deactivateKeepAwake('r503-active-trip');
-    } catch {
-      // Best effort — safe to call even if no lock was acquired.
-    }
+    await releaseWakeLock();
     this.stopHealthTimer();
     this.stopWatchdog();
   }
@@ -906,7 +988,10 @@ class TripController {
         const staleMs = lastWriteMs != null && Number.isFinite(lastWriteMs) ? Date.now() - lastWriteMs : null;
         const noPointYetMs = this.state.startedAtMs != null ? Date.now() - this.state.startedAtMs : null;
         if ((staleMs != null && staleMs > 45_000) || (lastWriteMs == null && noPointYetMs != null && noPointYetMs > 45_000)) {
-          await this.resubscribeBackgroundTracking('gps-watchdog');
+          const staleSec = staleMs != null ? Math.round(staleMs / 1000) : null;
+          const body = staleSec != null ? `GPS gap ${staleSec}s — reconnecting` : 'GPS signal lost — reconnecting';
+          this.setState({ gpsHealthStatus: 'offline' });
+          await this.resubscribeBackgroundTracking('gps-watchdog', body);
         }
       }
     } catch (error) {

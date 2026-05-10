@@ -25,6 +25,8 @@ export interface ActiveTripSession {
   v1StopState?: StopDetectionState;
   variantId?: string;
   lastFix: PersistedFix | null;
+  /** Auto-detected from GPS movement; overrides user-selected directionCode for stop ordering. */
+  detectedDirectionCode?: DirectionCode | null;
 }
 
 const SESSION_FILE_NAME = 'active_trip_session.json';

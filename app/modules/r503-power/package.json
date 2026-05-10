@@ -1,0 +1,7 @@
+{
+  "name": "r503-power",
+  "version": "1.0.0",
+  "description": "PARTIAL_WAKE_LOCK + battery-optimization helpers for the R503 trip logger.",
+  "main": "src/index.ts",
+  "private": true
+}
