@@ -4,7 +4,7 @@ import { getDb } from '../../database/db';
 import { haversineMeters } from '../services/location/filters';
 import type { RouteStop, StopDetectionState } from '../services/location/stopDetector';
 import { appendAuditLog } from '../services/location/fileAudit';
-import { VARIANT } from '../utils/experimentConfig';
+import { SENSING_CONFIG, VARIANT } from '../utils/experimentConfig';
 import { createUuidV4 } from '../utils/id';
 import { loadSettings, saveSettings } from '../utils/settingsStore';
 import type { DirectionCode, WindowCode } from '../../models/Trip';
@@ -74,14 +74,14 @@ export async function ensureDeviceRegistered(): Promise<string> {
   return deviceId;
 }
 
-export function resolveVariantId(directionCode: DirectionCode, windowCode: WindowCode): string {
-  if (windowCode === 'PM') {
-    return 'r503_pm';
-  }
-  if (windowCode === 'AM') {
-    return 'r503_am';
-  }
-  return directionCode === 'B' ? 'r503_pm' : 'r503_off';
+export function resolveVariantId(directionCode: DirectionCode, _windowCode: WindowCode): string {
+  // The stops table is keyed by direction (all R503 stops are seeded with
+  // direction_code='A' → 'r503_am'). The window_code (AM/PM/OFF) is a TIME
+  // bucket metadata and must NOT change which stop set we look up against.
+  // Previously this returned 'r503_pm' for any PM trip, which produced zero
+  // stop_events because no stops exist under r503_pm (direction-B stops
+  // haven't been seeded). time_bucket already preserves the window code.
+  return directionCode === 'B' ? 'r503_pm' : 'r503_am';
 }
 
 export function computeTimeBucket(timestampMs: number): string {
@@ -105,10 +105,74 @@ export async function insertSessionMetadata(input: SessionMetadataInput): Promis
   );
 }
 
-export async function markSessionEnded(tripId: string, endedAtMs: number): Promise<void> {
+export async function markSessionEnded(
+  tripId: string,
+  endedAtMs: number,
+  endedReason: string | null = null,
+): Promise<void> {
   const db = await getDb();
-  await db.runAsync('UPDATE trip_sessions SET ended_at = ? WHERE trip_id = ?;', [new Date(endedAtMs).toISOString(), tripId]);
+  await db.runAsync(
+    'UPDATE trip_sessions SET ended_at = ?, ended_reason = COALESCE(?, ended_reason) WHERE trip_id = ?;',
+    [new Date(endedAtMs).toISOString(), endedReason, tripId],
+  );
   await updateTripMaxGapSec(tripId);
+}
+
+export interface DanglingTripRecovery {
+  tripId: string;
+  startedAt: string;
+  endedAtMs: number;
+  pointCount: number;
+}
+
+export async function finalizeDanglingTrips(excludeTripId: string | null): Promise<DanglingTripRecovery[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ trip_id: string; started_at: string }>(
+    'SELECT trip_id, started_at FROM trip_sessions WHERE ended_at IS NULL;',
+  );
+  const recovered: DanglingTripRecovery[] = [];
+  for (const row of rows) {
+    if (excludeTripId && row.trip_id === excludeTripId) {
+      continue;
+    }
+    const last = await db.getFirstAsync<{ timestamp_ms: number | null }>(
+      'SELECT MAX(timestamp_ms) as timestamp_ms FROM gps_points WHERE trip_id = ?;',
+      [row.trip_id],
+    );
+    const startMs = Date.parse(row.started_at);
+    const fallbackMs = Number.isFinite(startMs) ? startMs + 1000 : Date.now();
+    const endedAtMs = last?.timestamp_ms != null && Number.isFinite(last.timestamp_ms) ? last.timestamp_ms : fallbackMs;
+    const pointRow = await db.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) as count FROM gps_points WHERE trip_id = ?;',
+      [row.trip_id],
+    );
+    await markSessionEnded(row.trip_id, endedAtMs, 'auto_finalized_orphan');
+    await db.runAsync(
+      "UPDATE trip SET ended_at_ms = COALESCE(ended_at_ms, ?), status = 'stopped' WHERE trip_id = ? AND (status IS NULL OR status != 'stopped');",
+      [endedAtMs, row.trip_id],
+    );
+    await appendAuditLog({
+      scope: 'recovery',
+      action: 'auto-finalize-orphan',
+      trip_id: row.trip_id,
+      message: `Orphan trip finalized at ${new Date(endedAtMs).toISOString()} (${pointRow?.count ?? 0} pts)`,
+    });
+    recovered.push({
+      tripId: row.trip_id,
+      startedAt: row.started_at,
+      endedAtMs,
+      pointCount: pointRow?.count ?? 0,
+    });
+  }
+  return recovered;
+}
+
+export async function insertBatterySample(tripId: string, timestampMs: number, levelPct: number): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO battery_samples (trip_id, timestamp_ms, level_pct) VALUES (?, ?, ?);',
+    [tripId, timestampMs, levelPct],
+  );
 }
 
 export async function loadStopsForVariant(variantId: string): Promise<RouteStop[]> {
@@ -122,13 +186,62 @@ export async function loadStopsForVariant(variantId: string): Promise<RouteStop[
   );
 }
 
+const pointBuffer: PersistPointInput[] = [];
+let bufferLastFlushAtMs = Date.now();
+let flushInFlight: Promise<void> | null = null;
+
 export async function persistPoint(input: PersistPointInput): Promise<void> {
-  const db = await getDb();
-  await insertPointNow(db, input);
+  pointBuffer.push(input);
+  const overSize = pointBuffer.length >= Math.max(1, SENSING_CONFIG.writeBufferSize);
+  const overTime =
+    SENSING_CONFIG.writeBufferTimeoutMs > 0 &&
+    Date.now() - bufferLastFlushAtMs >= SENSING_CONFIG.writeBufferTimeoutMs;
+  if (overSize || overTime) {
+    await flushPointBuffer();
+  }
 }
 
 export async function flushPointBuffer(): Promise<void> {
-  return;
+  if (flushInFlight) {
+    await flushInFlight;
+    return;
+  }
+  if (pointBuffer.length === 0) {
+    bufferLastFlushAtMs = Date.now();
+    return;
+  }
+  const drained = pointBuffer.splice(0, pointBuffer.length);
+  flushInFlight = (async () => {
+    try {
+      const db = await getDb();
+      await db.withTransactionAsync(async () => {
+        for (const input of drained) {
+          await insertPointNow(db, input);
+        }
+      });
+    } catch (error) {
+      // Re-queue on failure so we don't drop data.
+      pointBuffer.unshift(...drained);
+      await appendAuditLog({
+        scope: 'point-buffer',
+        action: 'flush-failed',
+        message: error instanceof Error ? error.message : 'unknown error',
+        pending_count: pointBuffer.length,
+      });
+      throw error;
+    } finally {
+      bufferLastFlushAtMs = Date.now();
+    }
+  })();
+  try {
+    await flushInFlight;
+  } finally {
+    flushInFlight = null;
+  }
+}
+
+export function getPendingPointCount(): number {
+  return pointBuffer.length;
 }
 
 async function insertPointNow(db: Awaited<ReturnType<typeof getDb>>, input: PersistPointInput): Promise<void> {
@@ -213,6 +326,8 @@ export async function updateTripTaskRestartCount(tripId: string, taskRestartCoun
 }
 
 export async function persistStopEvent(input: PersistStopEventInput): Promise<boolean> {
+  // Stop events trigger segment rebuilds; ensure buffered points are visible.
+  await flushPointBuffer();
   const db = await getDb();
   const duplicateEvent = await db.getFirstAsync<{ count: number }>(
     `SELECT COUNT(*) as count FROM stop_events
@@ -310,6 +425,8 @@ export async function persistStopEvent(input: PersistStopEventInput): Promise<bo
 }
 
 export async function rebuildSegmentsForTrip(tripId: string): Promise<void> {
+  // Segment metrics scan gps_points; ensure buffered points are visible.
+  await flushPointBuffer();
   const db = await getDb();
   const stopOrders = await db.getAllAsync<{ stop_id: string; stop_order: number }>(
     `SELECT s.stop_id, s.stop_order

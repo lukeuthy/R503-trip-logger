@@ -41,6 +41,13 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
   const stops = await db.getAllAsync<Record<string, unknown>>(
     'SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code FROM stop ORDER BY stop_sequence ASC;',
   );
+  const batterySamples = await db.getAllAsync<Record<string, unknown>>(
+    'SELECT id, trip_id, timestamp_ms, level_pct FROM battery_samples WHERE trip_id = ? ORDER BY timestamp_ms ASC;',
+    [canonicalTripId],
+  );
+  const recoveredOrphans = await db.getAllAsync<Record<string, unknown>>(
+    "SELECT trip_id, started_at, ended_at, ended_reason FROM trip_sessions WHERE ended_reason = 'auto_finalized_orphan' ORDER BY started_at DESC;",
+  );
 
   const session = (tripSessions[0] ?? {}) as {
     started_at?: string;
@@ -180,7 +187,9 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
     { name: 'stop_events.csv', content: toCsv(stopEventsRows) },
     { name: 'segment_times.csv', content: toCsv(segmentRows) },
     { name: 'stops.csv', content: toCsv(stops) },
+    { name: 'battery_samples.csv', content: toCsv(batterySamples) },
     { name: 'metadata.json', content: JSON.stringify(metadataObject, null, 2) },
+    { name: 'recovery_metadata.json', content: JSON.stringify({ orphan_recoveries: recoveredOrphans }, null, 2) },
     { name: 'tracking_audit.log', content: auditLogContent },
     {
       name: 'bundle.json',
@@ -192,7 +201,9 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
           stop_events: stopEventsRows,
           segment_times: segmentRows,
           stops,
+          battery_samples: batterySamples,
           metadata: metadataObject,
+          orphan_recoveries: recoveredOrphans,
           export_validation_issues: issues,
         },
         null,

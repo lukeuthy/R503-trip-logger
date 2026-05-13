@@ -1,9 +1,10 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Battery from 'expo-battery';
+import * as Location from 'expo-location';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { AppState, type AppStateStatus } from 'react-native';
 
-import { getDb } from '../database/db';
+import { getDb, isDbInitialized } from '../database/db';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
 import { exportTripBundle } from '../src/services/export/exportBundle';
 import { haversineMeters } from '../src/services/location/filters';
@@ -23,9 +24,14 @@ import {
   stopBackgroundTracking,
   type BackgroundTripUpdate,
 } from './backgroundLocationTask';
+import { registerBackgroundWatchdog } from './backgroundWatchdogTask';
+import { clearTripNotification, publishTripNotification } from './tripNotification';
 import { createInitialStopDetectorState, getStopDetectionConfig, type StopInfo } from './stopDetector';
 import {
+  type DanglingTripRecovery,
+  finalizeDanglingTrips,
   flushPointBuffer,
+  insertBatterySample,
   insertSessionMetadata,
   loadTrackingHealth,
   loadTripDebug,
@@ -37,7 +43,19 @@ import { isIgnoringBatteryOptimizations, requestIgnoreBatteryOptimizations } fro
 import { SENSING_CONFIG, VARIANT } from '../src/utils/experimentConfig';
 
 const APP_VERSION = '1.0.0-v1.0';
-const MAX_LOG_LINES = 40;
+const MAX_LOG_LINES = 200;
+const NOTIFICATION_UPDATE_INTERVAL_MS = 10_000;
+const BATTERY_SAMPLE_INTERVAL_MS = 5 * 60_000;
+const SYSTEM_STATUS_REFRESH_INTERVAL_MS = 5_000;
+
+function getWatchdogThresholdMs(): number {
+  // 6× sampling interval, clamped to [15s, 90s]. exp-high → 15s, medium → 30s, low → 60s.
+  return Math.min(90_000, Math.max(15_000, SENSING_CONFIG.samplingIntervalMs * 6));
+}
+
+function getWatchdogIntervalMs(): number {
+  return Math.min(30_000, Math.max(10_000, Math.floor(getWatchdogThresholdMs() / 2)));
+}
 
 export interface UITripState {
   status: 'idle' | 'recording' | 'stopped';
@@ -81,9 +99,27 @@ export interface UITripState {
   healthStopEvents: number;
   healthAuditLines: number;
   healthLastWriteIso: string | null;
+  healthLastWriteMs: number | null;
   healthAuditPath: string | null;
   lastError: string | null;
   logs: string[];
+  // System Status fields
+  dbReady: boolean;
+  foregroundPermissionGranted: boolean | null;
+  backgroundPermissionGranted: boolean | null;
+  locationServicesEnabled: boolean | null;
+  batteryOptimizationWhitelisted: boolean | null;
+  foregroundServiceActive: boolean;
+  wakeLockHeld: boolean;
+  taskRestartCount: number;
+  variantLabel: string;
+  variantSamplingMs: number;
+  variantId: string;
+  variantUseForegroundService: boolean;
+  backgroundPermissionRevoked: boolean;
+  lastTaskErrorAt: number | null;
+  lastTaskErrorMessage: string | null;
+  recoveredOrphans: DanglingTripRecovery[];
 }
 
 class TripController {
@@ -121,9 +157,26 @@ class TripController {
     healthStopEvents: 0,
     healthAuditLines: 0,
     healthLastWriteIso: null,
+    healthLastWriteMs: null,
     healthAuditPath: null,
     lastError: null,
     logs: [],
+    dbReady: false,
+    foregroundPermissionGranted: null,
+    backgroundPermissionGranted: null,
+    locationServicesEnabled: null,
+    batteryOptimizationWhitelisted: null,
+    foregroundServiceActive: false,
+    wakeLockHeld: false,
+    taskRestartCount: 0,
+    variantLabel: SENSING_CONFIG.label,
+    variantSamplingMs: SENSING_CONFIG.samplingIntervalMs,
+    variantId: VARIANT,
+    variantUseForegroundService: SENSING_CONFIG.useForegroundService,
+    backgroundPermissionRevoked: false,
+    lastTaskErrorAt: null,
+    lastTaskErrorMessage: null,
+    recoveredOrphans: [],
   };
 
   private listeners = new Set<(state: UITripState) => void>();
@@ -136,6 +189,9 @@ class TripController {
   private backgroundedAtMs: number | null = null;
   private lastResubscribeAtMs = 0;
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
+  private notificationTimer: ReturnType<typeof setInterval> | null = null;
+  private batterySamplerTimer: ReturnType<typeof setInterval> | null = null;
+  private systemStatusTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     setTripUpdateListener((update) => {
@@ -236,9 +292,16 @@ class TripController {
       };
       await saveActiveTripSession(session);
 
-      await this.requestBatteryWhitelistIfNeeded();
+      await this.verifyBatteryWhitelist();
       await ensureBackgroundLocationReady();
       await startBackgroundTracking();
+      this.setState({
+        foregroundServiceActive: SENSING_CONFIG.useForegroundService,
+        foregroundPermissionGranted: true,
+        backgroundPermissionGranted: true,
+        locationServicesEnabled: true,
+        backgroundPermissionRevoked: false,
+      });
 
       // Acquire a trip-scoped PARTIAL_WAKE_LOCK so the CPU stays alive for the
       // entire recording session. Gated so the bg-degraded variant (no foreground
@@ -246,14 +309,20 @@ class TripController {
       if (SENSING_CONFIG.useForegroundService) {
         try {
           await activateKeepAwakeAsync('r503-active-trip');
+          this.setState({ wakeLockHeld: true });
           this.appendLog('[WAKELOCK] Acquired');
         } catch {
+          this.setState({ wakeLockHeld: false });
           // best-effort; foreground service still runs without it
         }
+      } else {
+        this.setState({ wakeLockHeld: false });
       }
 
-      // Start watchdog to detect silent GPS stoppage
+      // Start watchdog (variant-tuned), notification updater, battery sampler
       this.startWatchdog(tripId);
+      this.startNotificationUpdater();
+      this.startBatterySampler(tripId);
 
       this.setState({
         status: 'recording',
@@ -302,6 +371,9 @@ class TripController {
             'start_failed',
             tripIdForRollback,
           ]);
+          // Atomically finalize the trip_sessions row so A1's bootstrap sweep
+          // does not need to clean it up next launch.
+          await markSessionEnded(tripIdForRollback, Date.now(), 'start_failed');
         } catch {
           // Keep primary failure surfaced.
         }
@@ -316,8 +388,11 @@ class TripController {
         tripId: null,
         startedAtMs: null,
         lastError: message,
+        foregroundServiceActive: false,
+        wakeLockHeld: false,
       });
       this.appendLog(`Start failed: ${message}`);
+      void clearTripNotification();
     }
   }
 
@@ -335,13 +410,18 @@ class TripController {
 
     try {
       await stopBackgroundTracking();
+      this.setState({ foregroundServiceActive: false });
       try {
         deactivateKeepAwake('r503-active-trip');
+        this.setState({ wakeLockHeld: false });
         this.appendLog('[WAKELOCK] Released');
       } catch {
         // best-effort
       }
       await flushPointBuffer();
+      this.stopNotificationUpdater();
+      this.stopBatterySampler();
+      void clearTripNotification();
 
       const db = await getDb();
       const endedAtMs = Date.now();
@@ -350,7 +430,7 @@ class TripController {
         'stopped',
         this.state.tripId,
       ]);
-      await markSessionEnded(this.state.tripId, endedAtMs);
+      await markSessionEnded(this.state.tripId, endedAtMs, 'user_stop');
       const batteryEndLevel = await Battery.getBatteryLevelAsync();
       const batteryEndPct = Number.isFinite(batteryEndLevel) ? Math.round(batteryEndLevel * 100) : null;
       const storedBattery = await db.getFirstAsync<{ battery_start_pct: number | null }>(
@@ -536,6 +616,7 @@ class TripController {
   private async bootstrap(): Promise<void> {
     try {
       await getDb();
+      this.setState({ dbReady: true });
       const settings = await loadSettings();
       this.setState({
         chartsMode: settings.chartsMode,
@@ -543,11 +624,33 @@ class TripController {
       });
       const shareAvailable = await isSharingAvailable();
       this.setState({ shareAvailable });
-    } catch {
-      // Best effort.
+    } catch (error) {
+      this.appendLog(`Bootstrap warning: ${getErrorMessage(error)}`);
     }
 
+    // Auto-finalize any orphan trips from a prior crash before recovering.
+    try {
+      const activeSession = await loadActiveTripSession();
+      const recovered = await finalizeDanglingTrips(activeSession?.tripId ?? null);
+      if (recovered.length > 0) {
+        this.setState({ recoveredOrphans: recovered });
+        for (const orphan of recovered) {
+          this.appendLog(
+            `[RECOVERY] Auto-finalized orphan trip ${orphan.tripId.slice(0, 8)} (${orphan.pointCount} pts)`,
+          );
+        }
+      }
+    } catch (error) {
+      this.appendLog(`Orphan cleanup warning: ${getErrorMessage(error)}`);
+    }
+
+    await this.refreshSystemStatus();
+    this.startSystemStatusTimer();
     await this.recoverActiveTrip();
+
+    // Register out-of-process watchdog so the OS can revive GPS even if our
+    // JS context is suspended. Fires every ~15min subject to OS throttling.
+    void registerBackgroundWatchdog();
   }
 
   private async recoverActiveTrip(): Promise<void> {
@@ -595,31 +698,198 @@ class TripController {
       if (!running) {
         await startBackgroundTracking();
         this.appendLog('Recovered trip and restarted background tracking.');
-        this.startWatchdog(session.tripId);
       } else {
         this.appendLog('Recovered active trip after app restart.');
-        this.startWatchdog(session.tripId);
       }
+      this.setState({ foregroundServiceActive: SENSING_CONFIG.useForegroundService });
+      // Re-acquire wake lock if the variant uses it (process may have been
+      // recycled so the lock was lost).
+      if (SENSING_CONFIG.useForegroundService) {
+        try {
+          await activateKeepAwakeAsync('r503-active-trip');
+          this.setState({ wakeLockHeld: true });
+          this.appendLog('[WAKELOCK] Re-acquired after recovery');
+        } catch {
+          // best-effort
+        }
+      }
+      this.startWatchdog(session.tripId);
+      this.startNotificationUpdater();
+      this.startBatterySampler(session.tripId);
     } catch (error) {
       this.appendLog(`Recovery warning: ${getErrorMessage(error)}`);
     }
   }
 
-  private async requestBatteryWhitelistIfNeeded(): Promise<void> {
+  private async verifyBatteryWhitelist(): Promise<void> {
+    // Run on EVERY trip start — the user may have re-enabled battery
+    // optimization in system settings since we last asked. We only PROMPT
+    // once (to avoid pestering), but we always loudly warn if not whitelisted
+    // so the System Status card can surface the risk.
     try {
-      const settings = await loadSettings();
-      if (settings.batteryOptimizationPrompted) {
-        return;
-      }
-      await saveSettings({ batteryOptimizationPrompted: true });
       const ignoring = await isIgnoringBatteryOptimizations();
+      this.setState({ batteryOptimizationWhitelisted: ignoring });
       if (ignoring) {
         return;
       }
-      const granted = await requestIgnoreBatteryOptimizations();
-      this.appendLog(granted ? 'Battery optimization whitelist confirmed.' : 'Battery optimization whitelist not granted.');
+      const settings = await loadSettings();
+      if (!settings.batteryOptimizationPrompted) {
+        await saveSettings({ batteryOptimizationPrompted: true });
+        const granted = await requestIgnoreBatteryOptimizations();
+        this.setState({ batteryOptimizationWhitelisted: granted });
+        this.appendLog(granted ? 'Battery optimization whitelist confirmed.' : 'Battery optimization whitelist not granted.');
+        return;
+      }
+      this.appendLog('[BATTERY] Not whitelisted — task may be killed by Doze. Open system settings to re-enable.');
     } catch (error) {
-      this.appendLog(`Battery optimization prompt warning: ${getErrorMessage(error)}`);
+      this.appendLog(`Battery optimization check warning: ${getErrorMessage(error)}`);
+    }
+  }
+
+  private async refreshSystemStatus(): Promise<void> {
+    try {
+      const dbReady = await isDbInitialized();
+      this.setState({ dbReady });
+    } catch {
+      // best-effort
+    }
+    try {
+      const fg = await Location.getForegroundPermissionsAsync();
+      this.setState({ foregroundPermissionGranted: fg.status === 'granted' });
+    } catch {
+      this.setState({ foregroundPermissionGranted: null });
+    }
+    try {
+      const bg = await Location.getBackgroundPermissionsAsync();
+      this.setState({ backgroundPermissionGranted: bg.status === 'granted' });
+    } catch {
+      this.setState({ backgroundPermissionGranted: null });
+    }
+    try {
+      const services = await Location.hasServicesEnabledAsync();
+      this.setState({ locationServicesEnabled: services });
+    } catch {
+      this.setState({ locationServicesEnabled: null });
+    }
+    try {
+      const ignoring = await isIgnoringBatteryOptimizations();
+      this.setState({ batteryOptimizationWhitelisted: ignoring });
+    } catch {
+      this.setState({ batteryOptimizationWhitelisted: null });
+    }
+    // Truth check: is the background task registration actually alive?
+    // If we believe we're recording but the system says no task is running,
+    // the OS killed our foreground service (common on MIUI/EMUI). Surface
+    // it via the System card indicator going red; don't overwrite an
+    // existing lastError, but log the transition.
+    if (this.state.status === 'recording') {
+      try {
+        const taskAlive = await isBackgroundTrackingRunning();
+        const wasAlive = this.state.foregroundServiceActive;
+        this.setState({ foregroundServiceActive: taskAlive });
+        if (wasAlive && !taskAlive) {
+          this.appendLog('[SERVICE-DEATH] Background task is no longer registered. Trying foreground restart.');
+          // We are foregrounded (status refresh runs in foreground), so a
+          // restart is allowed by Android. Kick off the resubscribe path.
+          void this.resubscribeBackgroundTracking('service-death-detected');
+        }
+      } catch {
+        // best-effort
+      }
+    }
+
+    // While recording: detect permission revocation and pause cleanly.
+    if (this.state.status === 'recording' && this.state.backgroundPermissionGranted === false) {
+      if (!this.state.backgroundPermissionRevoked) {
+        this.appendLog('[PERMISSION] Background location revoked — pausing recording');
+        this.setState({
+          backgroundPermissionRevoked: true,
+          lastError: 'Background location permission revoked — recording paused. Re-grant "Allow all the time".',
+        });
+        await this.safeBackgroundCleanup();
+        this.setState({ foregroundServiceActive: false, wakeLockHeld: false });
+      }
+    } else if (this.state.backgroundPermissionRevoked && this.state.backgroundPermissionGranted) {
+      // User re-granted — clear the banner.
+      this.setState({ backgroundPermissionRevoked: false });
+    }
+  }
+
+  private startSystemStatusTimer(): void {
+    this.stopSystemStatusTimer();
+    this.systemStatusTimer = setInterval(() => {
+      void this.refreshSystemStatus();
+    }, SYSTEM_STATUS_REFRESH_INTERVAL_MS);
+  }
+
+  private stopSystemStatusTimer(): void {
+    if (this.systemStatusTimer) {
+      clearInterval(this.systemStatusTimer);
+      this.systemStatusTimer = null;
+    }
+  }
+
+  private startNotificationUpdater(): void {
+    this.stopNotificationUpdater();
+    void this.publishLiveNotification();
+    this.notificationTimer = setInterval(() => {
+      void this.publishLiveNotification();
+    }, NOTIFICATION_UPDATE_INTERVAL_MS);
+  }
+
+  private stopNotificationUpdater(): void {
+    if (this.notificationTimer) {
+      clearInterval(this.notificationTimer);
+      this.notificationTimer = null;
+    }
+  }
+
+  private async publishLiveNotification(): Promise<void> {
+    if (this.state.status !== 'recording' || !this.state.tripId) {
+      return;
+    }
+    const lastMs = this.state.healthLastWriteMs ?? this.state.lastFix?.timestampMs ?? null;
+    const ageSec = lastMs != null ? Math.max(0, Math.floor((Date.now() - lastMs) / 1000)) : null;
+    try {
+      await publishTripNotification({
+        tripId: this.state.tripId,
+        elapsedSec: this.state.elapsedSeconds,
+        pointsCount: this.state.pointsCount,
+        lastGpsAgeSec: ageSec,
+        taskRestartCount: this.state.taskRestartCount,
+        variantLabel: this.state.variantLabel,
+        wakeLockHeld: this.state.wakeLockHeld,
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private startBatterySampler(tripId: string): void {
+    this.stopBatterySampler();
+    void this.sampleBatteryNow(tripId);
+    this.batterySamplerTimer = setInterval(() => {
+      void this.sampleBatteryNow(tripId);
+    }, BATTERY_SAMPLE_INTERVAL_MS);
+  }
+
+  private stopBatterySampler(): void {
+    if (this.batterySamplerTimer) {
+      clearInterval(this.batterySamplerTimer);
+      this.batterySamplerTimer = null;
+    }
+  }
+
+  private async sampleBatteryNow(tripId: string): Promise<void> {
+    try {
+      const level = await Battery.getBatteryLevelAsync();
+      if (!Number.isFinite(level)) {
+        return;
+      }
+      const pct = Math.round(level * 100);
+      await insertBatterySample(tripId, Date.now(), pct);
+    } catch {
+      // best-effort
     }
   }
 
@@ -629,19 +899,45 @@ class TripController {
 
     if (nextState === 'background' || nextState === 'inactive') {
       this.backgroundedAtMs = Date.now();
+      // Flush any pending buffered points before the OS suspends us so they
+      // are durably persisted even if our JS context gets killed.
+      try {
+        await flushPointBuffer();
+      } catch {
+        // best-effort
+      }
       return;
     }
 
-    if (nextState !== 'active' || previousState === 'active' || this.state.status !== 'recording') {
+    if (nextState !== 'active' || previousState === 'active') {
       return;
     }
 
-    const backgroundDurationMs = this.backgroundedAtMs == null ? null : Date.now() - this.backgroundedAtMs;
-    if (backgroundDurationMs == null || backgroundDurationMs < 60_000) {
+    // On every active resume, refresh system status (permissions may have
+    // changed while we were backgrounded).
+    void this.refreshSystemStatus();
+
+    if (this.state.status !== 'recording') {
       return;
     }
 
-    await this.resubscribeBackgroundTracking('foreground-resume');
+    // Variant-tuned gap check on resume: if the last GPS write is older than
+    // our threshold, force a re-subscribe immediately. Drops the previous
+    // 60s flat gate which was too coarse for high/medium variants.
+    try {
+      const db = await getDb();
+      const row = await db.getFirstAsync<{ timestamp_ms: number | null }>(
+        'SELECT MAX(timestamp_ms) as timestamp_ms FROM gps_points WHERE trip_id = ?;',
+        [this.state.tripId],
+      );
+      const lastMs = row?.timestamp_ms ?? null;
+      const ageMs = lastMs != null ? Date.now() - lastMs : Date.now() - (this.state.startedAtMs ?? Date.now());
+      if (ageMs >= getWatchdogThresholdMs()) {
+        await this.resubscribeBackgroundTracking('foreground-resume');
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   private async resubscribeBackgroundTracking(reason: string): Promise<void> {
@@ -722,6 +1018,17 @@ class TripController {
   }
 
   private handleBackgroundTripUpdate(update: BackgroundTripUpdate): void {
+    if (update.type === 'task-error') {
+      const message = `Background task error: ${update.message}`;
+      this.setState({
+        lastError: message,
+        lastTaskErrorAt: update.ts,
+        lastTaskErrorMessage: update.message,
+      });
+      this.appendLog(`[TASK-ERROR] ${update.message}`);
+      return;
+    }
+
     if (!this.state.tripId || update.tripId !== this.state.tripId) {
       return;
     }
@@ -814,21 +1121,29 @@ class TripController {
 
   private startWatchdog(tripId: string): void {
     this.stopWatchdog();
+    const thresholdMs = getWatchdogThresholdMs();
+    const intervalMs = getWatchdogIntervalMs();
+    this.appendLog(
+      `[WATCHDOG] Started (threshold=${Math.round(thresholdMs / 1000)}s, interval=${Math.round(intervalMs / 1000)}s, variant=${VARIANT})`,
+    );
     this.watchdogTimer = setInterval(async () => {
       try {
         const db = await getDb();
-        const row = await db.getFirstAsync<{ timestamp_ms: number }>(
-          'SELECT timestamp_ms FROM gps_points WHERE trip_id = ? ORDER BY timestamp_ms DESC LIMIT 1',
+        const row = await db.getFirstAsync<{ timestamp_ms: number | null }>(
+          'SELECT MAX(timestamp_ms) as timestamp_ms FROM gps_points WHERE trip_id = ?;',
           [tripId],
         );
-        const gap = (Date.now() - (row?.timestamp_ms ?? 0)) / 1000;
-        if (gap > 60) {
+        const lastMs = row?.timestamp_ms ?? null;
+        const startedMs = this.state.startedAtMs ?? Date.now();
+        const ageMs = lastMs != null ? Date.now() - lastMs : Date.now() - startedMs;
+        if (ageMs >= thresholdMs) {
+          this.appendLog(`[WATCHDOG] Stale GPS (age=${Math.round(ageMs / 1000)}s) — resubscribing`);
           await this.resubscribeBackgroundTracking('watchdog');
         }
       } catch {
         // best-effort
       }
-    }, 30000);
+    }, intervalMs);
   }
 
   private stopWatchdog(): void {
@@ -856,6 +1171,9 @@ class TripController {
     }
     this.stopHealthTimer();
     this.stopWatchdog();
+    this.stopNotificationUpdater();
+    this.stopBatterySampler();
+    void clearTripNotification();
   }
 
   private appendLog(message: string): void {
@@ -893,19 +1211,27 @@ class TripController {
     }
     try {
       const [dbHealth, audit] = await Promise.all([loadTrackingHealth(this.state.tripId), getAuditStats()]);
+      const db = await getDb();
+      const restartRow = await db.getFirstAsync<{ task_restart_count: number | null }>(
+        'SELECT task_restart_count FROM trip_sessions WHERE trip_id = ?;',
+        [this.state.tripId],
+      );
+      const lastWriteMs = dbHealth.lastV1TsIso != null ? new Date(dbHealth.lastV1TsIso).getTime() : dbHealth.lastLegacyTsMs;
       this.setState({
         healthLegacyPoints: dbHealth.legacyPoints,
         healthV1Points: dbHealth.v1Points,
         healthStopEvents: dbHealth.stopEvents,
         healthAuditLines: audit.lines,
         healthLastWriteIso: dbHealth.lastV1TsIso ?? (dbHealth.lastLegacyTsMs ? new Date(dbHealth.lastLegacyTsMs).toISOString() : null),
+        healthLastWriteMs: lastWriteMs ?? null,
         healthAuditPath: audit.path,
+        taskRestartCount: restartRow?.task_restart_count ?? 0,
       });
       if (this.state.status === 'recording') {
-        const lastWriteMs = dbHealth.lastV1TsIso != null ? new Date(dbHealth.lastV1TsIso).getTime() : dbHealth.lastLegacyTsMs;
+        const thresholdMs = getWatchdogThresholdMs();
         const staleMs = lastWriteMs != null && Number.isFinite(lastWriteMs) ? Date.now() - lastWriteMs : null;
         const noPointYetMs = this.state.startedAtMs != null ? Date.now() - this.state.startedAtMs : null;
-        if ((staleMs != null && staleMs > 45_000) || (lastWriteMs == null && noPointYetMs != null && noPointYetMs > 45_000)) {
+        if ((staleMs != null && staleMs > thresholdMs) || (lastWriteMs == null && noPointYetMs != null && noPointYetMs > thresholdMs)) {
           await this.resubscribeBackgroundTracking('gps-watchdog');
         }
       }

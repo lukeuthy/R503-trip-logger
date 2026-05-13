@@ -133,6 +133,15 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'trip_sessions', 'battery_end_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_end_pct INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'battery_drain_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_drain_pct INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'max_gap_sec', 'ALTER TABLE trip_sessions ADD COLUMN max_gap_sec REAL;');
+  await ensureColumn(db, 'trip_sessions', 'ended_reason', 'ALTER TABLE trip_sessions ADD COLUMN ended_reason TEXT;');
+  await db.execAsync(`CREATE TABLE IF NOT EXISTS battery_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trip_id TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    level_pct INTEGER NOT NULL,
+    FOREIGN KEY(trip_id) REFERENCES trip_sessions(trip_id)
+  );`);
+  await db.execAsync('CREATE INDEX IF NOT EXISTS idx_battery_samples_trip_ts ON battery_samples(trip_id, timestamp_ms);');
   await ensureColumn(db, 'segment_times', 'quality_flag', 'ALTER TABLE segment_times ADD COLUMN quality_flag TEXT;');
   await ensureColumn(db, 'segment_times', 'point_count', 'ALTER TABLE segment_times ADD COLUMN point_count INTEGER;');
   await ensureColumn(db, 'segment_times', 'max_gap_sec', 'ALTER TABLE segment_times ADD COLUMN max_gap_sec REAL;');

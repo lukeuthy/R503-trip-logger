@@ -1,10 +1,12 @@
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
+import { AppState } from 'react-native';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import type { DirectionCode } from '../models/Trip';
 import {
+  flushPointBuffer,
   loadStopsForVariant,
   persistPoint,
   persistStopEvent,
@@ -14,14 +16,11 @@ import {
 import { deriveHeadingDeg, haversineMeters } from '../src/services/location/filters';
 import type { RouteStop } from '../src/services/location/stopDetector';
 import { appendAuditLog } from '../src/services/location/fileAudit';
+import { SENSING_CONFIG } from '../src/utils/experimentConfig';
 import { loadActiveTripSession, saveActiveTripSession, type ActiveTripSession } from './activeTripStore';
 
 export const R503_BACKGROUND_TASK = 'R503_BACKGROUND_LOCATION_TASK';
 
-const GPS_INTERVAL_MS = 5000;
-const ENTER_DISTANCE_M = 35;
-const EXIT_DISTANCE_M = 60;
-const DWELL_MS = 8000;
 const EXIT_CONSECUTIVE_POINTS = 3;
 const EMA_ALPHA = 0.3;
 const LOW_ACCURACY_M = 40;
@@ -29,7 +28,8 @@ const GAP_RESET_MS = 60_000;
 
 type TripUpdateListener = (update: BackgroundTripUpdate) => void;
 
-export interface BackgroundTripUpdate {
+export interface BackgroundTripPointUpdate {
+  type: 'point-update';
   tripId: string;
   pointsInserted: number;
   eventsInserted: number;
@@ -49,6 +49,15 @@ export interface BackgroundTripUpdate {
   lastFilterReason: string | null;
   expectedNextStopName: string | null;
 }
+
+export interface BackgroundTripErrorUpdate {
+  type: 'task-error';
+  tripId: string | null;
+  message: string;
+  ts: number;
+}
+
+export type BackgroundTripUpdate = BackgroundTripPointUpdate | BackgroundTripErrorUpdate;
 
 interface StoredGpsPoint {
   timestamp_ms: number;
@@ -140,10 +149,24 @@ export async function restartBackgroundTracking(): Promise<void> {
 
 export async function stopBackgroundTracking(): Promise<void> {
   const running = await isBackgroundTrackingRunning();
-  if (!running) {
-    return;
+  if (running) {
+    try {
+      await Location.stopLocationUpdatesAsync(R503_BACKGROUND_TASK);
+    } catch {
+      // continue to unregister below
+    }
   }
-  await Location.stopLocationUpdatesAsync(R503_BACKGROUND_TASK);
+  // Defensively unregister the TaskManager binding so OS-level callbacks
+  // don't fire against a stopped trip if expo-location leaks a registration.
+  // The defineTask binding at module scope is preserved and will pick up
+  // again on the next startBackgroundTracking().
+  try {
+    if (await TaskManager.isTaskRegisteredAsync(R503_BACKGROUND_TASK)) {
+      await TaskManager.unregisterTaskAsync(R503_BACKGROUND_TASK);
+    }
+  } catch {
+    // best-effort
+  }
   try {
     deactivateKeepAwake('r503-gps');
   } catch {
@@ -152,35 +175,68 @@ export async function stopBackgroundTracking(): Promise<void> {
 }
 
 function getLocationTaskOptions(): Location.LocationTaskOptions {
-  return {
+  const base: Location.LocationTaskOptions = {
     accuracy: Location.Accuracy.BestForNavigation,
-    timeInterval: GPS_INTERVAL_MS,
+    timeInterval: SENSING_CONFIG.samplingIntervalMs,
     distanceInterval: 0,
     pausesUpdatesAutomatically: false,
     showsBackgroundLocationIndicator: true,
-    foregroundService: {
-      notificationTitle: 'R503 Logger',
-      notificationBody: 'Collecting GPS data',
-      killServiceOnDestroy: false,
-    } as Location.LocationTaskServiceOptions,
   };
+  if (SENSING_CONFIG.useForegroundService) {
+    base.foregroundService = {
+      notificationTitle: 'R503 Logger',
+      notificationBody: `Recording ${SENSING_CONFIG.label} trip`,
+      killServiceOnDestroy: false,
+    } as Location.LocationTaskServiceOptions;
+  }
+  return base;
 }
 
 async function resubscribeGPS(): Promise<void> {
-  try {
-    const running = await isBackgroundTrackingRunning();
-    if (running) {
-      await Location.stopLocationUpdatesAsync(R503_BACKGROUND_TASK);
-    }
-  } catch {
-    // Re-start below even if stop fails.
-  }
+  // CRITICAL Android 12+ constraint: a foreground service cannot be started
+  // while the app is in the background — startLocationUpdatesAsync with a
+  // foregroundService config throws ForegroundServiceStartNotAllowedException.
+  //
+  // Previously this function did stop -> start, which guaranteed that if the
+  // task fired while the app was backgrounded (e.g. taskBody.error inside
+  // Doze), we'd kill the running service and then fail to restart it,
+  // producing 21-minute GPS blackouts. Field log showed 11+ occurrences of
+  // "Couldn't start the foreground service" with task_restart_count climbing.
+  //
+  // New strategy:
+  //   1. Never call stopLocationUpdatesAsync from this recovery path.
+  //   2. If the task is already running, just re-acquire the wake lock and
+  //      return — the OS will keep delivering callbacks.
+  //   3. Only attempt startLocationUpdatesAsync if NOT already running AND
+  //      the app is in the foreground; if backgrounded, log and bail so the
+  //      foreground watchdog / AppState resume picks it up.
   try {
     await activateKeepAwakeAsync('r503-gps');
   } catch {
     // best-effort
   }
-  await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
+  const running = await isBackgroundTrackingRunning();
+  if (running) {
+    return;
+  }
+  const appForeground = AppState.currentState === 'active';
+  if (!appForeground) {
+    await appendAuditLog({
+      scope: 'background-task',
+      action: 'resubscribe-skipped',
+      reason: 'app-backgrounded-fg-service-restricted',
+    });
+    return;
+  }
+  try {
+    await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
+  } catch (error) {
+    await appendAuditLog({
+      scope: 'background-task',
+      action: 'resubscribe-failed',
+      message: error instanceof Error ? error.message : 'unknown',
+    });
+  }
 }
 
 if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
@@ -202,6 +258,14 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
           action: 'task-error',
           message: taskBody.error.message,
         });
+        if (tripUpdateListener) {
+          tripUpdateListener({
+            type: 'task-error',
+            tripId: session?.tripId ?? null,
+            message: taskBody.error.message,
+            ts: Date.now(),
+          });
+        }
         return;
       }
 
@@ -235,7 +299,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
       let pointsInserted = 0;
       let eventsInserted = 0;
       let segmentUpdates = 0;
-      let lastUpdate: BackgroundTripUpdate | null = null;
+      let lastUpdate: BackgroundTripPointUpdate | null = null;
 
       for (const location of [...locations].sort((a, b) => a.timestamp - b.timestamp)) {
         // Discard GPS callbacks that fired before the trip was officially started.
@@ -276,6 +340,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
           },
         };
         lastUpdate = {
+          type: 'point-update',
           tripId: mutableSession.tripId,
           pointsInserted,
           eventsInserted,
@@ -297,17 +362,33 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
         };
       }
 
+      // Flush any buffered points before saving the session — guarantees
+      // foreground listeners and segment rebuilds see the latest data.
+      try {
+        await flushPointBuffer();
+      } catch {
+        // already audit-logged inside flushPointBuffer
+      }
       await saveActiveTripSession(mutableSession);
       if (lastUpdate && tripUpdateListener) {
         tripUpdateListener(lastUpdate);
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
       await appendAuditLog({
         scope: 'background-task',
         action: 'exception',
         trip_id: session?.tripId ?? null,
-        message: error instanceof Error ? error.message : 'unknown error',
+        message,
       });
+      if (tripUpdateListener) {
+        tripUpdateListener({
+          type: 'task-error',
+          tripId: session?.tripId ?? null,
+          message,
+          ts: Date.now(),
+        });
+      }
     }
   });
 }
@@ -370,7 +451,21 @@ async function insertGPSPoint(tripId: string, location: Location.LocationObject)
     // point to compute derived_speed_mps from the correct baseline.
     isFiltered = true;
     filterReason = 'post-gap-reset';
-  } else if (speedMps === 0 && headingDeg === 0) {
+  } else if (
+    speedMps === 0 &&
+    headingDeg === 0 &&
+    (
+      // Only treat speed=0+heading=0 as a "cold start" garbage fix when:
+      //   (a) accuracy is suspicious — provider hasn't locked yet
+      //   (b) the previous point was itself filtered (post-gap recovery context)
+      // Otherwise it is most likely a legitimate stationary fix (red light,
+      // bus dwelling at a stop), and we MUST keep it for arrive/dwell detection.
+      // Previous version filtered ANY 0/0 point, which silently dropped almost
+      // every stop dwell sample and corrupted segment stats.
+      (accuracyM != null && accuracyM > 20) ||
+      (previousPoint != null && previousPoint.is_filtered === 1)
+    )
+  ) {
     isFiltered = true;
     filterReason = 'cold_start_zero_values';
   } else if (accuracyM != null && accuracyM > LOW_ACCURACY_M) {
@@ -479,12 +574,12 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
   const nearest = getNearestStop(stops, point.smoothedLat, point.smoothedLon);
   let target = await getTargetStop(tripId, stops);
 
-  // Skip-stop: if the bus is within EXIT_DISTANCE_M of a stop that is ahead of the
+  // Skip-stop: if the bus is within SENSING_CONFIG.departureRadiusM of a stop that is ahead of the
   // current target, the bus has passed the target without stopping. Mark the target
   // as EXITED (skipped) and advance. Repeats if multiple stops were skipped.
   if (target && nearest.stop && nearest.distanceM != null &&
       nearest.stop.stopOrder > target.stopOrder &&
-      nearest.distanceM <= EXIT_DISTANCE_M) {
+      nearest.distanceM <= SENSING_CONFIG.departureRadiusM) {
     const db = await getDb();
     const targetState = await loadStopState(tripId, target.stopId);
     if (targetState.state !== 'ARRIVED' && targetState.state !== 'DWELLING') {
@@ -529,7 +624,7 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
   let dwellAtMs = state.dwell_at_ms;
   let exitCandidateCount = state.exit_candidate_count ?? 0;
 
-  if ((state.state === 'OUTSIDE' || state.state === 'NEAR') && distM <= ENTER_DISTANCE_M) {
+  if ((state.state === 'OUTSIDE' || state.state === 'NEAR') && distM <= SENSING_CONFIG.geofenceRadiusM) {
     nextState = 'ARRIVED';
     enteredAtMs = point.timestampMs;
     exitCandidateCount = 0;
@@ -539,16 +634,16 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
       segmentsUpdated += 1;
     }
   } else if (state.state === 'ARRIVED' || state.state === 'DWELLING') {
-    if (distM <= ENTER_DISTANCE_M) {
+    if (distM <= SENSING_CONFIG.geofenceRadiusM) {
       exitCandidateCount = 0;
-      if (state.state === 'ARRIVED' && enteredAtMs != null && point.timestampMs - enteredAtMs >= DWELL_MS) {
+      if (state.state === 'ARRIVED' && enteredAtMs != null && point.timestampMs - enteredAtMs >= SENSING_CONFIG.dwellTimeMs) {
         nextState = 'DWELLING';
         dwellAtMs = point.timestampMs;
         if (await insertStopEventIfAllowed(tripId, target, 'dwell', point, distM)) {
           eventsInserted += 1;
         }
       }
-    } else if (distM >= EXIT_DISTANCE_M) {
+    } else if (distM >= SENSING_CONFIG.departureRadiusM) {
       exitCandidateCount += 1;
       if (exitCandidateCount >= EXIT_CONSECUTIVE_POINTS) {
         nextState = 'EXITED';
@@ -580,8 +675,8 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
     segmentsUpdated,
     nearestStopName: nearest.stop?.name ?? null,
     nearestDistanceM: nearest.distanceM,
-    insideStopName: distM <= ENTER_DISTANCE_M ? target.name : null,
-    insideState: distM <= ENTER_DISTANCE_M ? 'INSIDE' : 'OUTSIDE',
+    insideStopName: distM <= SENSING_CONFIG.geofenceRadiusM ? target.name : null,
+    insideState: distM <= SENSING_CONFIG.geofenceRadiusM ? 'INSIDE' : 'OUTSIDE',
     expectedNextStopName: target.name,
   };
 }

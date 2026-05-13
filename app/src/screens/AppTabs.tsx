@@ -4,10 +4,11 @@ import { Pressable, SafeAreaView, StyleSheet, Text, View } from 'react-native';
 import { colors } from '../theme/tokens';
 import { DashboardScreen } from './DashboardScreen';
 import { ExportsScreen } from './ExportsScreen';
+import { LogsScreen } from './LogsScreen';
 import { SettingsScreen } from './SettingsScreen';
 import { TripScreen } from './TripScreen';
 
-type TabId = 'dashboard' | 'trip' | 'exports' | 'settings';
+type TabId = 'dashboard' | 'trip' | 'exports' | 'logs' | 'settings';
 
 export function AppTabs() {
   const [tab, setTab] = useState<TabId>('dashboard');
@@ -17,12 +18,14 @@ export function AppTabs() {
         {tab === 'dashboard' ? <DashboardScreen /> : null}
         {tab === 'trip' ? <TripScreen /> : null}
         {tab === 'exports' ? <ExportsScreen /> : null}
+        {tab === 'logs' ? <LogsScreen /> : null}
         {tab === 'settings' ? <SettingsScreen /> : null}
       </View>
       <View style={styles.tabBar}>
         <TabButton active={tab === 'dashboard'} label="Dashboard" onPress={() => setTab('dashboard')} />
         <TabButton active={tab === 'trip'} label="Trip" onPress={() => setTab('trip')} />
         <TabButton active={tab === 'exports'} label="Export" onPress={() => setTab('exports')} />
+        <TabButton active={tab === 'logs'} label="Logs" onPress={() => setTab('logs')} />
         <TabButton active={tab === 'settings'} label="Settings" onPress={() => setTab('settings')} />
       </View>
     </SafeAreaView>
