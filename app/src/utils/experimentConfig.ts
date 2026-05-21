@@ -27,7 +27,7 @@ export interface SensingConfig {
 
 const configs: Record<ExperimentVariant, SensingConfig> = {
   high: {
-    samplingIntervalMs: 2000,
+    samplingIntervalMs: 1000,
     fastestIntervalMs: 1000,
     writeBufferSize: 1,
     writeBufferTimeoutMs: 0,
@@ -38,8 +38,8 @@ const configs: Record<ExperimentVariant, SensingConfig> = {
     label: 'HIGH-FREQ',
   },
   medium: {
-    samplingIntervalMs: 5000,
-    fastestIntervalMs: 3000,
+    samplingIntervalMs: 1000,
+    fastestIntervalMs: 1000,
     writeBufferSize: 1,
     writeBufferTimeoutMs: 0,
     geofenceRadiusM: 40,
@@ -49,8 +49,8 @@ const configs: Record<ExperimentVariant, SensingConfig> = {
     label: 'MEDIUM-FREQ',
   },
   low: {
-    samplingIntervalMs: 10000,
-    fastestIntervalMs: 7000,
+    samplingIntervalMs: 1000,
+    fastestIntervalMs: 1000,
     writeBufferSize: 20,
     writeBufferTimeoutMs: 60000,
     geofenceRadiusM: 55,
@@ -60,8 +60,8 @@ const configs: Record<ExperimentVariant, SensingConfig> = {
     label: 'LOW-FREQ',
   },
   'bg-degraded': {
-    samplingIntervalMs: 5000,
-    fastestIntervalMs: 3000,
+    samplingIntervalMs: 1000,
+    fastestIntervalMs: 1000,
     writeBufferSize: 1,
     writeBufferTimeoutMs: 0,
     geofenceRadiusM: 40,
