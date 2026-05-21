@@ -697,6 +697,16 @@ async function insertStopEventIfAllowed(
     if ((arrive?.count ?? 0) === 0) {
       return false;
     }
+    // Dedupe: only one dwell/exit per (trip_id, stop_id). Guards against the race
+    // where two consecutive GPS points both pass the EXIT_CONSECUTIVE_POINTS threshold
+    // before the stop_state row is updated to 'EXITED'.
+    const existing = await db.getFirstAsync<{ count: number }>(
+      'SELECT COUNT(*) as count FROM stop_events WHERE trip_id = ? AND stop_id = ? AND event_type = ?;',
+      [tripId, stop.stopId, eventType],
+    );
+    if ((existing?.count ?? 0) > 0) {
+      return false;
+    }
   }
   return persistStopEvent({
     tripId,
