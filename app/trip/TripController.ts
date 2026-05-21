@@ -1,7 +1,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Battery from 'expo-battery';
 import * as Location from 'expo-location';
-import { AppState, type AppStateStatus } from 'react-native';
+import { Alert, AppState, type AppStateStatus } from 'react-native';
 
 import { getDb, isDbInitialized } from '../database/db';
 import type { TripRow, DirectionCode, WindowCode } from '../models/Trip';
@@ -243,6 +243,15 @@ class TripController {
       return;
     }
 
+    // Check whether current Manila time falls inside the selected service window.
+    // Alert is shown before isBusy so the UI stays responsive during the prompt.
+    const { hour, timeStr } = getManilaTime(Date.now());
+    const outsideOperationalWindow = !isInsideOperationalWindow(this.state.windowCode, hour);
+    if (outsideOperationalWindow) {
+      const proceed = await showOutsideWindowAlert(this.state.windowCode, timeStr);
+      if (!proceed) return;
+    }
+
     this.setState({ isBusy: true, lastError: null });
     this.appendLog('Starting v1.0 trip session...');
 
@@ -269,6 +278,7 @@ class TripController {
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         startTimestampMs: startedAtMs,
         taskRestartCount: 0,
+        outsideOperationalWindow,
       });
       this.taskRestartStartCount = 0;
       const batteryStartLevel = await Battery.getBatteryLevelAsync();
@@ -1230,6 +1240,35 @@ class TripController {
       this.appendLog(`Health refresh warning: ${getErrorMessage(error)}`);
     }
   }
+}
+
+// Asia/Manila is UTC+8 with no DST — simple fixed offset is correct.
+function getManilaTime(nowMs: number): { hour: number; timeStr: string } {
+  const manilaMs = nowMs + 8 * 60 * 60 * 1000;
+  const d = new Date(manilaMs);
+  const hour = d.getUTCHours();
+  const min = d.getUTCMinutes();
+  return { hour, timeStr: `${String(hour).padStart(2, '0')}:${String(min).padStart(2, '0')}` };
+}
+
+function isInsideOperationalWindow(windowCode: WindowCode, hour: number): boolean {
+  if (windowCode === 'AM') return hour >= 6 && hour < 10;   // 06:00–10:00 Manila
+  if (windowCode === 'PM') return hour >= 16 && hour < 21;  // 16:00–21:00 Manila
+  return true; // 'OFF' has no window constraint
+}
+
+function showOutsideWindowAlert(windowCode: string, currentTime: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    Alert.alert(
+      'Outside service window',
+      `You selected the ${windowCode} window but the current time is ${currentTime} (Manila time). Are you sure you want to continue?`,
+      [
+        { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+        { text: 'Continue Anyway', onPress: () => resolve(true) },
+      ],
+      { cancelable: false },
+    );
+  });
 }
 
 function getErrorMessage(error: unknown): string {

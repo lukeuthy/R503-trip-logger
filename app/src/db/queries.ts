@@ -17,6 +17,7 @@ export interface SessionMetadataInput {
   timezone: string;
   startTimestampMs: number;
   taskRestartCount?: number | null;
+  outsideOperationalWindow?: boolean;
 }
 
 export interface PersistPointInput {
@@ -49,6 +50,9 @@ export interface PersistStopEventInput {
   lon?: number | null;
   speedMps: number | null;
   accuracyM: number | null;
+  // Dwell-only diagnostics — null for arrive/exit events.
+  dwellSpeedMps?: number | null;
+  dwellSpeedConfirmed?: boolean | null;
 }
 
 export async function ensureDeviceRegistered(): Promise<string> {
@@ -97,11 +101,14 @@ export async function insertSessionMetadata(input: SessionMetadataInput): Promis
   const startedAtIso = new Date(input.startTimestampMs).toISOString();
   const timeBucket = computeTimeBucket(input.startTimestampMs);
 
+  const outsideWindowInt =
+    input.outsideOperationalWindow == null ? null : input.outsideOperationalWindow ? 1 : 0;
+
   await db.runAsync(
     `INSERT OR IGNORE INTO trip_sessions
-      (trip_id, device_id, variant_id, started_at, ended_at, timezone, app_version, time_bucket, notes, experiment_variant, task_restart_count)
-     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, NULL, ?, ?);`,
-    [input.tripId, deviceId, variantId, startedAtIso, input.timezone, input.appVersion, timeBucket, VARIANT, input.taskRestartCount ?? null],
+      (trip_id, device_id, variant_id, started_at, ended_at, timezone, app_version, time_bucket, window_code, outside_operational_window, notes, experiment_variant, task_restart_count)
+     VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, ?, ?);`,
+    [input.tripId, deviceId, variantId, startedAtIso, input.timezone, input.appVersion, timeBucket, input.windowCode, outsideWindowInt, VARIANT, input.taskRestartCount ?? null],
   );
 }
 
@@ -395,9 +402,12 @@ export async function persistStopEvent(input: PersistStopEventInput): Promise<bo
   }
 
   const eventId = createUuidV4();
+  const dwellSpeedConfirmedInt =
+    input.dwellSpeedConfirmed == null ? null : input.dwellSpeedConfirmed ? 1 : 0;
   await db.runAsync(
-    `INSERT INTO stop_events (event_id, trip_id, stop_id, event_type, timestamp_ms, ts, dist_m, dist_to_stop_m, lat, lon, speed_mps, accuracy_m)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO stop_events
+      (event_id, trip_id, stop_id, event_type, timestamp_ms, ts, dist_m, dist_to_stop_m, lat, lon, speed_mps, accuracy_m, dwell_speed_mps, dwell_speed_confirmed)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
       eventId,
       input.tripId,
@@ -411,6 +421,8 @@ export async function persistStopEvent(input: PersistStopEventInput): Promise<bo
       input.lon ?? null,
       input.speedMps,
       input.accuracyM,
+      input.dwellSpeedMps ?? null,
+      dwellSpeedConfirmedInt,
     ],
   );
   await appendAuditLog({

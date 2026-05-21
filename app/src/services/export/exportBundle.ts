@@ -58,9 +58,13 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
     battery_drain_pct?: number | null;
     task_restart_count?: number | null;
     time_bucket?: string | null;
+    window_code?: string | null;
+    outside_operational_window?: number | null;
     device_id?: string;
     app_version?: string;
   };
+  // window_code may also come from the legacy trip table for older exports
+  const tripLegacyRow = (tripLegacy[0] ?? {}) as { window_code?: string | null };
   const startedAtMs = session.started_at ? new Date(session.started_at).getTime() : null;
   const gpsRows: Record<string, unknown>[] = gpsRaw.map((row, index) => {
     const ts = String(row.ts ?? '');
@@ -154,6 +158,12 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
     battery_drain_pct: metadata.batteryDrainPct,
     max_gap_sec: metadata.maxGapSec,
     task_restart_count: metadata.taskRestartCount,
+    // window_code is the user-selected service window ("AM" | "PM" | "OFF") — never a clock-hour string.
+    // time_bucket is a separate derived field ("HH-(HH+1)") computed from the trip start time.
+    window_code: tripLegacyRow.window_code ?? session.window_code ?? null,
+    time_bucket: session.time_bucket ?? null,
+    outside_operational_window:
+      session.outside_operational_window != null ? session.outside_operational_window === 1 : null,
     started_at: session.started_at ?? null,
     ended_at: session.ended_at ?? null,
     duration_sec: durationSec,

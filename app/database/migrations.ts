@@ -127,6 +127,8 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'stop_events', 'dist_m', 'ALTER TABLE stop_events ADD COLUMN dist_m REAL;');
   await ensureColumn(db, 'stop_events', 'lat', 'ALTER TABLE stop_events ADD COLUMN lat REAL;');
   await ensureColumn(db, 'stop_events', 'lon', 'ALTER TABLE stop_events ADD COLUMN lon REAL;');
+  await ensureColumn(db, 'stop_events', 'dwell_speed_mps', 'ALTER TABLE stop_events ADD COLUMN dwell_speed_mps REAL;');
+  await ensureColumn(db, 'stop_events', 'dwell_speed_confirmed', 'ALTER TABLE stop_events ADD COLUMN dwell_speed_confirmed INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'experiment_variant', 'ALTER TABLE trip_sessions ADD COLUMN experiment_variant TEXT;');
   await ensureColumn(db, 'trip_sessions', 'task_restart_count', 'ALTER TABLE trip_sessions ADD COLUMN task_restart_count INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'battery_start_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_start_pct INTEGER;');
@@ -134,6 +136,8 @@ async function ensureLegacyColumns(db: SQLite.SQLiteDatabase): Promise<void> {
   await ensureColumn(db, 'trip_sessions', 'battery_drain_pct', 'ALTER TABLE trip_sessions ADD COLUMN battery_drain_pct INTEGER;');
   await ensureColumn(db, 'trip_sessions', 'max_gap_sec', 'ALTER TABLE trip_sessions ADD COLUMN max_gap_sec REAL;');
   await ensureColumn(db, 'trip_sessions', 'ended_reason', 'ALTER TABLE trip_sessions ADD COLUMN ended_reason TEXT;');
+  await ensureColumn(db, 'trip_sessions', 'window_code', 'ALTER TABLE trip_sessions ADD COLUMN window_code TEXT;');
+  await ensureColumn(db, 'trip_sessions', 'outside_operational_window', 'ALTER TABLE trip_sessions ADD COLUMN outside_operational_window INTEGER;');
   await db.execAsync(`CREATE TABLE IF NOT EXISTS battery_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     trip_id TEXT NOT NULL,

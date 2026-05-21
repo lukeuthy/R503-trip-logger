@@ -90,6 +90,8 @@ export const CREATE_V1_TABLE_STATEMENTS: string[] = [
     timezone TEXT NOT NULL,
     app_version TEXT NOT NULL,
     time_bucket TEXT NOT NULL,
+    window_code TEXT,
+    outside_operational_window INTEGER,
     notes TEXT,
     experiment_variant TEXT,
     task_restart_count INTEGER,
@@ -142,6 +144,8 @@ export const CREATE_V1_TABLE_STATEMENTS: string[] = [
     lon REAL,
     speed_mps REAL,
     accuracy_m REAL,
+    dwell_speed_mps REAL,
+    dwell_speed_confirmed INTEGER,
     FOREIGN KEY(trip_id) REFERENCES trip_sessions(trip_id),
     FOREIGN KEY(stop_id) REFERENCES stops(stop_id)
   );`,

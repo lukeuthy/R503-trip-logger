@@ -655,6 +655,9 @@ async function insertStopEventIfAllowed(
     lon: point.smoothedLon,
     speedMps: point.speedMps,
     accuracyM: point.accuracyM,
+    dwellSpeedMps: eventType === 'dwell' ? point.speedMps : undefined,
+    dwellSpeedConfirmed:
+      eventType === 'dwell' && point.speedMps != null ? point.speedMps < 1.4 : undefined,
   });
 }
 
