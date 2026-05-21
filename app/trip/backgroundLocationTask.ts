@@ -1,8 +1,5 @@
-import BackgroundGeolocation, {
-  type Location as BGLocation,
-  DesiredAccuracy,
-  LogLevel,
-} from 'react-native-background-geolocation';
+import * as Location from 'expo-location';
+import { DeviceEventEmitter, NativeModules, Platform } from 'react-native';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import type { DirectionCode } from '../models/Trip';
@@ -94,8 +91,39 @@ interface StopStateRow {
   exit_candidate_count: number;
 }
 
+// ---------------------------------------------------------------------------
+// Native module bridge — R503LocationModule (Kotlin foreground service)
+// ---------------------------------------------------------------------------
+
+type NativeR503LocationModule = {
+  startTracking(options: {
+    intervalMs: number;
+    title: string;
+    text: string;
+    useForegroundService: boolean;
+  }): Promise<void>;
+  stopTracking(): Promise<void>;
+};
+
+// Native location event shape emitted by R503LocationService.kt
+interface NativeLocationEvent {
+  timestampMs: number;
+  latitude: number;
+  longitude: number;
+  accuracy: number;  // -1 if unknown
+  speed: number;     // -1 if unknown
+  heading: number;   // -1 if unknown
+  altitude: number;
+}
+
+const nativeModule = (Platform.OS === 'android'
+  ? NativeModules.R503LocationModule
+  : null) as NativeR503LocationModule | null;
+
 let tripUpdateListener: TripUpdateListener | null = null;
-let rnbgInitialized = false;
+let locationSubscription: ReturnType<typeof DeviceEventEmitter.addListener> | null = null;
+let restartSubscription: ReturnType<typeof DeviceEventEmitter.addListener> | null = null;
+let serviceRunning = false;
 // Tracks trips already counted for restart (survives JS reloads within same process)
 const countedTaskRuntimeTripIds = new Set<string>();
 const taskRuntimeStartedAtMs = Date.now();
@@ -105,74 +133,32 @@ export function setTripUpdateListener(listener: TripUpdateListener | null): void
 }
 
 // ---------------------------------------------------------------------------
-// RNBG initialisation — call once from TripController bootstrap
+// Initialisation — attach DeviceEventEmitter listeners (called once on bootstrap)
 // ---------------------------------------------------------------------------
 
-export async function initBackgroundGeolocation(): Promise<void> {
-  if (rnbgInitialized) return;
-  rnbgInitialized = true;
-
-  // v5 uses a nested config structure: { geolocation, activity, app, logger }
-  await BackgroundGeolocation.ready({
-    geolocation: {
-      // Best GPS accuracy (uses hardware GPS, not just WiFi/cell)
-      desiredAccuracy: DesiredAccuracy.High,
-      // Time-based sampling: distanceFilter=0 activates locationUpdateInterval
-      distanceFilter: 0,
-      locationUpdateInterval: SENSING_CONFIG.samplingIntervalMs,
-      fastestLocationUpdateInterval: SENSING_CONFIG.samplingIntervalMs,
-    },
-    activity: {
-      // Disable motion-detection stop: bus may sit at red lights without triggering "stationary"
-      disableMotionActivityUpdates: true,
-      disableStopDetection: true,
-    },
-    app: {
-      // Don't persist across app restarts — we start/stop explicitly
-      stopOnTerminate: true,
-      startOnBoot: false,
-      heartbeatInterval: 60,
-      // Foreground notification (Android foreground service with START_STICKY)
-      ...(SENSING_CONFIG.useForegroundService
-        ? {
-            notification: {
-              title: 'R503 Logger',
-              text: `GPS active (${SENSING_CONFIG.label})`,
-              sticky: true,
-            },
-          }
-        : {}),
-    },
-    logger: {
-      debug: false,
-      logLevel: LogLevel.Off,
-    },
-  });
-
-  BackgroundGeolocation.onLocation(handleLocationUpdate, handleLocationError);
-  BackgroundGeolocation.onHeartbeat(handleHeartbeat);
-  BackgroundGeolocation.onProviderChange((event) => {
-    void appendAuditLog({
-      scope: 'rnbg',
-      action: 'provider-change',
-      enabled: event.enabled,
-      status: event.status,
-    });
-  });
+export function initBackgroundGeolocation(): Promise<void> {
+  // Subscribe to location events from R503LocationService
+  if (!locationSubscription) {
+    locationSubscription = DeviceEventEmitter.addListener(
+      'r503-location',
+      (event: NativeLocationEvent) => { void handleLocationUpdate(event); },
+    );
+  }
+  // When the native service restarts (START_STICKY), increment the counter
+  if (!restartSubscription) {
+    restartSubscription = DeviceEventEmitter.addListener(
+      'r503-service-restart',
+      () => { void handleServiceRestart(); },
+    );
+  }
+  return Promise.resolve();
 }
 
-// ---------------------------------------------------------------------------
-// Headless task — fires when app process is restarted by RNBG's native service
-// ---------------------------------------------------------------------------
-
 export function registerRNBGHeadlessTask(): void {
-  BackgroundGeolocation.registerHeadlessTask(async (event) => {
-    if (event.name === 'location') {
-      await handleLocationUpdate(event.params as BGLocation);
-    } else if (event.name === 'heartbeat') {
-      await handleHeartbeat();
-    }
-  });
+  // Not needed for our native module approach — the service delivers events
+  // directly via DeviceEventEmitter when the JS engine is alive. When the
+  // process is killed, START_STICKY restarts the service AND the JS engine,
+  // which re-attaches the listeners via initBackgroundGeolocation() in bootstrap.
 }
 
 // ---------------------------------------------------------------------------
@@ -180,60 +166,98 @@ export function registerRNBGHeadlessTask(): void {
 // ---------------------------------------------------------------------------
 
 export async function ensureBackgroundLocationReady(): Promise<void> {
-  const status = await BackgroundGeolocation.requestPermission();
-  // status: 3 = AUTHORIZATION_STATUS_ALWAYS, 2 = AUTHORIZATION_STATUS_WHEN_IN_USE
-  if (status < 3) {
+  // Use expo-location just for permission checking — it's still installed and
+  // handles the permission UI. Our native service uses the same permissions.
+  let fg = await Location.getForegroundPermissionsAsync();
+  if (fg.status !== 'granted') {
+    fg = await Location.requestForegroundPermissionsAsync();
+  }
+  if (fg.status !== 'granted') {
+    throw new Error('Foreground location permission denied.');
+  }
+  let bg = await Location.getBackgroundPermissionsAsync();
+  if (bg.status !== 'granted') {
+    bg = await Location.requestBackgroundPermissionsAsync();
+  }
+  if (bg.status !== 'granted') {
     throw new Error('Background location permission denied. Set location access to "Allow all the time".');
+  }
+  const servicesEnabled = await Location.hasServicesEnabledAsync();
+  if (!servicesEnabled) {
+    throw new Error('Location services are OFF. Please enable GPS/location services.');
   }
 }
 
 export async function isBackgroundTrackingRunning(): Promise<boolean> {
-  const state = await BackgroundGeolocation.getState();
-  return state.enabled;
+  return serviceRunning;
 }
 
 export async function startBackgroundTracking(): Promise<void> {
-  const state = await BackgroundGeolocation.getState();
-  if (state.enabled) return;
-  await BackgroundGeolocation.start();
+  if (serviceRunning || !nativeModule) return;
+  await nativeModule.startTracking({
+    intervalMs: SENSING_CONFIG.samplingIntervalMs,
+    title: 'R503 Logger',
+    text: `GPS active (${SENSING_CONFIG.label})`,
+    useForegroundService: SENSING_CONFIG.useForegroundService,
+  });
+  serviceRunning = true;
 }
 
 export async function restartBackgroundTracking(): Promise<void> {
-  // RNBG start() is idempotent — safe to call when already running
-  await BackgroundGeolocation.start();
+  // If service died (serviceRunning=true but native service is gone), restart it
+  if (!nativeModule) return;
+  await nativeModule.startTracking({
+    intervalMs: SENSING_CONFIG.samplingIntervalMs,
+    title: 'R503 Logger',
+    text: `GPS active (${SENSING_CONFIG.label})`,
+    useForegroundService: SENSING_CONFIG.useForegroundService,
+  });
+  serviceRunning = true;
 }
 
 export async function stopBackgroundTracking(): Promise<void> {
-  await BackgroundGeolocation.stop();
+  if (!nativeModule) return;
+  await nativeModule.stopTracking();
+  serviceRunning = false;
 }
 
 // ---------------------------------------------------------------------------
 // Core location handler — called for every GPS fix
 // ---------------------------------------------------------------------------
 
-async function handleLocationUpdate(location: BGLocation): Promise<void> {
+async function handleServiceRestart(): Promise<void> {
+  serviceRunning = true;
+  const session = await loadActiveTripSession();
+  if (!session) return;
+  await incrementTripRestartCount(session.tripId);
+  await appendAuditLog({
+    scope: 'native-gps',
+    action: 'service-restarted',
+    trip_id: session.tripId,
+  });
+}
+
+async function handleLocationUpdate(event: NativeLocationEvent): Promise<void> {
   const session = await loadActiveTripSession();
   if (!session) return;
 
   try {
     if (!(await waitForDbInitialized())) {
       await appendAuditLog({
-        scope: 'rnbg',
+        scope: 'native-gps',
         action: 'db-not-initialized',
         trip_id: session.tripId,
       });
       return;
     }
 
-    // Detect service restarts: if the JS runtime started after the trip began,
-    // this is a restart. Increment the counter once per trip per JS runtime.
+    // Detect JS runtime restarts (process was killed and restarted by OS).
     if (!countedTaskRuntimeTripIds.has(session.tripId) && session.startedAtMs < taskRuntimeStartedAtMs - 10_000) {
       countedTaskRuntimeTripIds.add(session.tripId);
       await incrementTripRestartCount(session.tripId);
     }
 
-    // RNBG timestamp is an ISO-8601 string; convert to ms
-    const timestampMs = new Date(location.timestamp).getTime();
+    const timestampMs = event.timestampMs;
 
     // Discard fixes that predate the trip (can happen on first start)
     if (timestampMs < session.startedAtMs) return;
@@ -242,7 +266,7 @@ async function handleLocationUpdate(location: BGLocation): Promise<void> {
     const stops = await loadStopsForVariant(variantId);
     const mutableSession: ActiveTripSession = { ...session, variantId };
 
-    const point = await insertGPSPoint(session.tripId, location, timestampMs);
+    const point = await insertGPSPoint(session.tripId, event, timestampMs);
     let detection: StopDetectionResult = {
       eventsInserted: 0,
       segmentsUpdated: 0,
@@ -300,7 +324,7 @@ async function handleLocationUpdate(location: BGLocation): Promise<void> {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'unknown error';
     await appendAuditLog({
-      scope: 'rnbg',
+      scope: 'native-gps',
       action: 'location-handler-exception',
       trip_id: session?.tripId ?? null,
       message,
@@ -314,35 +338,6 @@ async function handleLocationUpdate(location: BGLocation): Promise<void> {
       });
     }
   }
-}
-
-function handleLocationError(code: number): void {
-  // LocationError in RNBG v5 is a numeric code (not an object)
-  void appendAuditLog({
-    scope: 'rnbg',
-    action: 'location-error',
-    code,
-  });
-  if (tripUpdateListener) {
-    void loadActiveTripSession().then((session) => {
-      tripUpdateListener?.({
-        type: 'task-error',
-        tripId: session?.tripId ?? null,
-        message: `GPS error code ${code}`,
-        ts: Date.now(),
-      });
-    });
-  }
-}
-
-async function handleHeartbeat(): Promise<void> {
-  const session = await loadActiveTripSession();
-  if (!session) return;
-  await appendAuditLog({
-    scope: 'rnbg',
-    action: 'heartbeat',
-    trip_id: session.tripId,
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -359,17 +354,14 @@ async function incrementTripRestartCount(tripId: string): Promise<void> {
   );
 }
 
-async function insertGPSPoint(tripId: string, location: BGLocation, timestampMs: number): Promise<InsertedGpsPoint> {
+async function insertGPSPoint(tripId: string, event: NativeLocationEvent, timestampMs: number): Promise<InsertedGpsPoint> {
   const db = await getDb();
-  const coords = location.coords;
-  const lat = coords.latitude;
-  const lon = coords.longitude;
-  // RNBG uses -1 for unknown; convert to null for DB nullability consistency
-  const accuracyM = coords.accuracy >= 0 ? coords.accuracy : null;
-  const speedMps =
-    coords.speed != null && Number.isFinite(coords.speed) && coords.speed >= 0 ? coords.speed : null;
-  const headingDeg =
-    coords.heading != null && Number.isFinite(coords.heading) && coords.heading >= 0 ? coords.heading : null;
+  const lat = event.latitude;
+  const lon = event.longitude;
+  // Native service uses -1 for unknown values
+  const accuracyM = event.accuracy >= 0 ? event.accuracy : null;
+  const speedMps = event.speed >= 0 ? event.speed : null;
+  const headingDeg = event.heading >= 0 ? event.heading : null;
 
   const previousPoint = await db.getFirstAsync<StoredGpsPoint>(
     `SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg, is_filtered, smoothed_lat, smoothed_lon, smoothed_speed_mps
@@ -465,7 +457,7 @@ async function insertGPSPoint(tripId: string, location: BGLocation, timestampMs:
     lat,
     lon,
     accuracyM,
-    altitudeM: coords.altitude ?? null,
+    altitudeM: null,
     speedMps,
     headingDeg,
     derivedSpeedMps,

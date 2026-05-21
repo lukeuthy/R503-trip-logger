@@ -1,11 +1,11 @@
 import * as BackgroundFetch from 'expo-background-fetch';
 import * as TaskManager from 'expo-task-manager';
-import BackgroundGeolocation from 'react-native-background-geolocation';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import { appendAuditLog } from '../src/services/location/fileAudit';
 import { SENSING_CONFIG } from '../src/utils/experimentConfig';
 import { loadActiveTripSession } from './activeTripStore';
+import { isBackgroundTrackingRunning, restartBackgroundTracking } from './backgroundLocationTask';
 
 export const R503_BACKGROUND_WATCHDOG_TASK = 'R503_BACKGROUND_WATCHDOG_TASK';
 
@@ -49,22 +49,19 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_WATCHDOG_TASK)) {
         return BackgroundFetch.BackgroundFetchResult.NoData;
       }
 
-      // With RNBG, start() is idempotent — safe to call even if already running.
-      // RNBG's START_STICKY service restarts itself natively; this is a belt-and-
-      // suspenders nudge from the out-of-process watchdog.
-      const rnbgState = await BackgroundGeolocation.getState();
-
-      if (rnbgState.enabled) {
+      // Belt-and-suspenders nudge: if the native service is already alive (JS
+      // tracking flag still true), nothing to do. Otherwise restart it.
+      if (await isBackgroundTrackingRunning()) {
         await appendAuditLog({
           scope: 'background-watchdog',
-          action: 'rnbg-already-running',
+          action: 'service-already-running',
           trip_id: session.tripId,
           age_ms: ageMs,
         });
         return BackgroundFetch.BackgroundFetchResult.NewData;
       }
 
-      await BackgroundGeolocation.start();
+      await restartBackgroundTracking();
 
       await db.runAsync(
         `UPDATE trip_sessions
@@ -75,7 +72,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_WATCHDOG_TASK)) {
 
       await appendAuditLog({
         scope: 'background-watchdog',
-        action: 'rnbg-restarted',
+        action: 'service-restarted',
         trip_id: session.tripId,
         age_ms: ageMs,
         threshold_ms: gapThresholdMs,

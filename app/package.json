@@ -27,8 +27,7 @@
     "expo-task-manager": "~55.0.4",
     "jszip": "^3.10.1",
     "react": "19.2.0",
-    "react-native": "0.83.2",
-    "react-native-background-geolocation": "^5.1.1"
+    "react-native": "0.83.2"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

@@ -17,8 +17,6 @@ allprojects {
     google()
     mavenCentral()
     maven { url 'https://www.jitpack.io' }
-    // react-native-background-geolocation: native tslocationmanager AAR
-    maven { url "${project(':react-native-background-geolocation').projectDir}/libs" }
   }
 }
 

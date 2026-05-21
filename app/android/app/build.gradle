@@ -81,10 +81,6 @@ def enableMinifyInReleaseBuilds = (findProperty('android.enableMinifyInReleaseBu
  */
 def jscFlavor = 'io.github.react-native-community:jsc-android:2026004.+'
 
-// react-native-background-geolocation: purges debug sound FX from release builds
-Project background_geolocation = project(':react-native-background-geolocation')
-apply from: "${background_geolocation.projectDir}/app.gradle"
-
 android {
     ndkVersion rootProject.ext.ndkVersion
 
