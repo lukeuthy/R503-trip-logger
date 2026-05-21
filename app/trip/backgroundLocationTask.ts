@@ -1,7 +1,8 @@
-import * as Location from 'expo-location';
-import * as TaskManager from 'expo-task-manager';
-import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
-import { AppState } from 'react-native';
+import BackgroundGeolocation, {
+  type Location as BGLocation,
+  DesiredAccuracy,
+  LogLevel,
+} from 'react-native-background-geolocation';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import type { DirectionCode } from '../models/Trip';
@@ -18,8 +19,6 @@ import type { RouteStop } from '../src/services/location/stopDetector';
 import { appendAuditLog } from '../src/services/location/fileAudit';
 import { SENSING_CONFIG } from '../src/utils/experimentConfig';
 import { loadActiveTripSession, saveActiveTripSession, type ActiveTripSession } from './activeTripStore';
-
-export const R503_BACKGROUND_TASK = 'R503_BACKGROUND_LOCATION_TASK';
 
 const EXIT_CONSECUTIVE_POINTS = 3;
 const EMA_ALPHA = 0.3;
@@ -96,6 +95,8 @@ interface StopStateRow {
 }
 
 let tripUpdateListener: TripUpdateListener | null = null;
+let rnbgInitialized = false;
+// Tracks trips already counted for restart (survives JS reloads within same process)
 const countedTaskRuntimeTripIds = new Set<string>();
 const taskRuntimeStartedAtMs = Date.now();
 
@@ -103,295 +104,250 @@ export function setTripUpdateListener(listener: TripUpdateListener | null): void
   tripUpdateListener = listener;
 }
 
+// ---------------------------------------------------------------------------
+// RNBG initialisation — call once from TripController bootstrap
+// ---------------------------------------------------------------------------
+
+export async function initBackgroundGeolocation(): Promise<void> {
+  if (rnbgInitialized) return;
+  rnbgInitialized = true;
+
+  // v5 uses a nested config structure: { geolocation, activity, app, logger }
+  await BackgroundGeolocation.ready({
+    geolocation: {
+      // Best GPS accuracy (uses hardware GPS, not just WiFi/cell)
+      desiredAccuracy: DesiredAccuracy.High,
+      // Time-based sampling: distanceFilter=0 activates locationUpdateInterval
+      distanceFilter: 0,
+      locationUpdateInterval: SENSING_CONFIG.samplingIntervalMs,
+      fastestLocationUpdateInterval: SENSING_CONFIG.samplingIntervalMs,
+    },
+    activity: {
+      // Disable motion-detection stop: bus may sit at red lights without triggering "stationary"
+      disableMotionActivityUpdates: true,
+      disableStopDetection: true,
+    },
+    app: {
+      // Don't persist across app restarts — we start/stop explicitly
+      stopOnTerminate: true,
+      startOnBoot: false,
+      heartbeatInterval: 60,
+      // Foreground notification (Android foreground service with START_STICKY)
+      ...(SENSING_CONFIG.useForegroundService
+        ? {
+            notification: {
+              title: 'R503 Logger',
+              text: `GPS active (${SENSING_CONFIG.label})`,
+              sticky: true,
+            },
+          }
+        : {}),
+    },
+    logger: {
+      debug: false,
+      logLevel: LogLevel.Off,
+    },
+  });
+
+  BackgroundGeolocation.onLocation(handleLocationUpdate, handleLocationError);
+  BackgroundGeolocation.onHeartbeat(handleHeartbeat);
+  BackgroundGeolocation.onProviderChange((event) => {
+    void appendAuditLog({
+      scope: 'rnbg',
+      action: 'provider-change',
+      enabled: event.enabled,
+      status: event.status,
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Headless task — fires when app process is restarted by RNBG's native service
+// ---------------------------------------------------------------------------
+
+export function registerRNBGHeadlessTask(): void {
+  BackgroundGeolocation.registerHeadlessTask(async (event) => {
+    if (event.name === 'location') {
+      await handleLocationUpdate(event.params as BGLocation);
+    } else if (event.name === 'heartbeat') {
+      await handleHeartbeat();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// GPS tracking lifecycle
+// ---------------------------------------------------------------------------
+
 export async function ensureBackgroundLocationReady(): Promise<void> {
-  let fg = await Location.getForegroundPermissionsAsync();
-  if (fg.status !== 'granted') {
-    fg = await Location.requestForegroundPermissionsAsync();
-  }
-  if (fg.status !== 'granted') {
-    throw new Error('Foreground location permission denied.');
-  }
-
-  let bg = await Location.getBackgroundPermissionsAsync();
-  if (bg.status !== 'granted') {
-    bg = await Location.requestBackgroundPermissionsAsync();
-  }
-  if (bg.status !== 'granted') {
+  const status = await BackgroundGeolocation.requestPermission();
+  // status: 3 = AUTHORIZATION_STATUS_ALWAYS, 2 = AUTHORIZATION_STATUS_WHEN_IN_USE
+  if (status < 3) {
     throw new Error('Background location permission denied. Set location access to "Allow all the time".');
-  }
-
-  const servicesEnabled = await Location.hasServicesEnabledAsync();
-  if (!servicesEnabled) {
-    throw new Error('Location services are OFF. Please enable GPS/location services.');
   }
 }
 
 export async function isBackgroundTrackingRunning(): Promise<boolean> {
-  return Location.hasStartedLocationUpdatesAsync(R503_BACKGROUND_TASK);
+  const state = await BackgroundGeolocation.getState();
+  return state.enabled;
 }
 
 export async function startBackgroundTracking(): Promise<void> {
-  const running = await isBackgroundTrackingRunning();
-  if (running) {
-    return;
-  }
-  try {
-    await activateKeepAwakeAsync('r503-gps');
-  } catch {
-    // best-effort
-  }
-  await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
+  const state = await BackgroundGeolocation.getState();
+  if (state.enabled) return;
+  await BackgroundGeolocation.start();
 }
 
 export async function restartBackgroundTracking(): Promise<void> {
-  await resubscribeGPS();
+  // RNBG start() is idempotent — safe to call when already running
+  await BackgroundGeolocation.start();
 }
 
 export async function stopBackgroundTracking(): Promise<void> {
-  const running = await isBackgroundTrackingRunning();
-  if (running) {
-    try {
-      await Location.stopLocationUpdatesAsync(R503_BACKGROUND_TASK);
-    } catch {
-      // continue to unregister below
-    }
-  }
-  // Defensively unregister the TaskManager binding so OS-level callbacks
-  // don't fire against a stopped trip if expo-location leaks a registration.
-  // The defineTask binding at module scope is preserved and will pick up
-  // again on the next startBackgroundTracking().
-  try {
-    if (await TaskManager.isTaskRegisteredAsync(R503_BACKGROUND_TASK)) {
-      await TaskManager.unregisterTaskAsync(R503_BACKGROUND_TASK);
-    }
-  } catch {
-    // best-effort
-  }
-  try {
-    deactivateKeepAwake('r503-gps');
-  } catch {
-    // best-effort
-  }
+  await BackgroundGeolocation.stop();
 }
 
-function getLocationTaskOptions(): Location.LocationTaskOptions {
-  const base: Location.LocationTaskOptions = {
-    accuracy: Location.Accuracy.BestForNavigation,
-    timeInterval: SENSING_CONFIG.samplingIntervalMs,
-    distanceInterval: 0,
-    pausesUpdatesAutomatically: false,
-    showsBackgroundLocationIndicator: true,
-  };
-  if (SENSING_CONFIG.useForegroundService) {
-    base.foregroundService = {
-      notificationTitle: 'R503 Logger',
-      notificationBody: `Recording ${SENSING_CONFIG.label} trip`,
-      killServiceOnDestroy: false,
-    } as Location.LocationTaskServiceOptions;
-  }
-  return base;
-}
+// ---------------------------------------------------------------------------
+// Core location handler — called for every GPS fix
+// ---------------------------------------------------------------------------
 
-async function resubscribeGPS(): Promise<void> {
-  // CRITICAL Android 12+ constraint: a foreground service cannot be started
-  // while the app is in the background — startLocationUpdatesAsync with a
-  // foregroundService config throws ForegroundServiceStartNotAllowedException.
-  //
-  // Previously this function did stop -> start, which guaranteed that if the
-  // task fired while the app was backgrounded (e.g. taskBody.error inside
-  // Doze), we'd kill the running service and then fail to restart it,
-  // producing 21-minute GPS blackouts. Field log showed 11+ occurrences of
-  // "Couldn't start the foreground service" with task_restart_count climbing.
-  //
-  // New strategy:
-  //   1. Never call stopLocationUpdatesAsync from this recovery path.
-  //   2. If the task is already running, just re-acquire the wake lock and
-  //      return — the OS will keep delivering callbacks.
-  //   3. Only attempt startLocationUpdatesAsync if NOT already running AND
-  //      the app is in the foreground; if backgrounded, log and bail so the
-  //      foreground watchdog / AppState resume picks it up.
+async function handleLocationUpdate(location: BGLocation): Promise<void> {
+  const session = await loadActiveTripSession();
+  if (!session) return;
+
   try {
-    await activateKeepAwakeAsync('r503-gps');
-  } catch {
-    // best-effort
-  }
-  const running = await isBackgroundTrackingRunning();
-  if (running) {
-    return;
-  }
-  const appForeground = AppState.currentState === 'active';
-  if (!appForeground) {
-    await appendAuditLog({
-      scope: 'background-task',
-      action: 'resubscribe-skipped',
-      reason: 'app-backgrounded-fg-service-restricted',
-    });
-    return;
-  }
-  try {
-    await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, getLocationTaskOptions());
-  } catch (error) {
-    await appendAuditLog({
-      scope: 'background-task',
-      action: 'resubscribe-failed',
-      message: error instanceof Error ? error.message : 'unknown',
-    });
-  }
-}
-
-if (!TaskManager.isTaskDefined(R503_BACKGROUND_TASK)) {
-  TaskManager.defineTask(R503_BACKGROUND_TASK, async (taskBody: TaskManager.TaskManagerTaskBody<{ locations?: Location.LocationObject[] }>) => {
-    const session = await loadActiveTripSession();
-    try {
-      try {
-        await activateKeepAwakeAsync('r503-gps');
-      } catch {
-        // best-effort
-      }
-      if (taskBody.error) {
-        if (session) {
-          await incrementTripRestartCount(session.tripId);
-        }
-        await resubscribeGPS();
-        await appendAuditLog({
-          scope: 'background-task',
-          action: 'task-error',
-          message: taskBody.error.message,
-        });
-        if (tripUpdateListener) {
-          tripUpdateListener({
-            type: 'task-error',
-            tripId: session?.tripId ?? null,
-            message: taskBody.error.message,
-            ts: Date.now(),
-          });
-        }
-        return;
-      }
-
-      if (!session) {
-        return;
-      }
-
-      if (!(await waitForDbInitialized())) {
-        await appendAuditLog({
-          scope: 'background-task',
-          action: 'db-not-initialized-timeout',
-          trip_id: session.tripId,
-        });
-        return;
-      }
-
-      if (!countedTaskRuntimeTripIds.has(session.tripId) && session.startedAtMs < taskRuntimeStartedAtMs - 10_000) {
-        countedTaskRuntimeTripIds.add(session.tripId);
-        await incrementTripRestartCount(session.tripId);
-        await resubscribeGPS();
-      }
-
-      const locations = (taskBody.data as { locations?: Location.LocationObject[] } | undefined)?.locations ?? [];
-      if (locations.length === 0) {
-        return;
-      }
-
-      const variantId = session.variantId ?? resolveVariantId(session.directionCode, session.windowCode);
-      const stops = await loadStopsForVariant(variantId);
-      let mutableSession: ActiveTripSession = { ...session, variantId };
-      let pointsInserted = 0;
-      let eventsInserted = 0;
-      let segmentUpdates = 0;
-      let lastUpdate: BackgroundTripPointUpdate | null = null;
-
-      for (const location of [...locations].sort((a, b) => a.timestamp - b.timestamp)) {
-        // Discard GPS callbacks that fired before the trip was officially started.
-        // The background task may already be running from a previous session,
-        // so its first few callbacks can predate startedAtMs by several minutes.
-        if (location.timestamp < mutableSession.startedAtMs) {
-          continue;
-        }
-        const point = await insertGPSPoint(mutableSession.tripId, location);
-        pointsInserted += 1;
-
-        let detection: StopDetectionResult = {
-          eventsInserted: 0,
-          segmentsUpdated: 0,
-          nearestStopName: null,
-          nearestDistanceM: null,
-          insideStopName: null,
-          insideState: 'OUTSIDE',
-          expectedNextStopName: null,
-        };
-        if (!point.isFiltered) {
-          detection = await runStopDetection(mutableSession.tripId, stops, point);
-          eventsInserted += detection.eventsInserted;
-          segmentUpdates += detection.segmentsUpdated;
-        }
-
-        mutableSession = {
-          ...mutableSession,
-          lastFix: {
-            timestampMs: point.timestampMs,
-            lat: point.lat,
-            lon: point.lon,
-            accuracyM: point.accuracyM,
-            speedMps: point.speedMps,
-            smoothedLat: point.smoothedLat,
-            smoothedLon: point.smoothedLon,
-            smoothedSpeedMps: point.smoothedSpeedMps,
-          },
-        };
-        lastUpdate = {
-          type: 'point-update',
-          tripId: mutableSession.tripId,
-          pointsInserted,
-          eventsInserted,
-          segmentUpdates,
-          lastFix: {
-            timestampMs: point.timestampMs,
-            lat: point.lat,
-            lon: point.lon,
-            accuracyM: point.accuracyM,
-            speedMps: point.speedMps,
-            headingDeg: point.headingDeg,
-          },
-          nearestStopName: detection.nearestStopName,
-          nearestStopDistanceM: detection.nearestDistanceM,
-          insideStopName: detection.insideStopName,
-          insideState: detection.insideState,
-          lastFilterReason: point.filterReason,
-          expectedNextStopName: detection.expectedNextStopName,
-        };
-      }
-
-      // Flush any buffered points before saving the session — guarantees
-      // foreground listeners and segment rebuilds see the latest data.
-      try {
-        await flushPointBuffer();
-      } catch {
-        // already audit-logged inside flushPointBuffer
-      }
-      await saveActiveTripSession(mutableSession);
-      if (lastUpdate && tripUpdateListener) {
-        tripUpdateListener(lastUpdate);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'unknown error';
+    if (!(await waitForDbInitialized())) {
       await appendAuditLog({
-        scope: 'background-task',
-        action: 'exception',
-        trip_id: session?.tripId ?? null,
-        message,
+        scope: 'rnbg',
+        action: 'db-not-initialized',
+        trip_id: session.tripId,
       });
-      if (tripUpdateListener) {
-        tripUpdateListener({
-          type: 'task-error',
-          tripId: session?.tripId ?? null,
-          message,
-          ts: Date.now(),
-        });
-      }
+      return;
     }
+
+    // Detect service restarts: if the JS runtime started after the trip began,
+    // this is a restart. Increment the counter once per trip per JS runtime.
+    if (!countedTaskRuntimeTripIds.has(session.tripId) && session.startedAtMs < taskRuntimeStartedAtMs - 10_000) {
+      countedTaskRuntimeTripIds.add(session.tripId);
+      await incrementTripRestartCount(session.tripId);
+    }
+
+    // RNBG timestamp is an ISO-8601 string; convert to ms
+    const timestampMs = new Date(location.timestamp).getTime();
+
+    // Discard fixes that predate the trip (can happen on first start)
+    if (timestampMs < session.startedAtMs) return;
+
+    const variantId = session.variantId ?? resolveVariantId(session.directionCode, session.windowCode);
+    const stops = await loadStopsForVariant(variantId);
+    const mutableSession: ActiveTripSession = { ...session, variantId };
+
+    const point = await insertGPSPoint(session.tripId, location, timestampMs);
+    let detection: StopDetectionResult = {
+      eventsInserted: 0,
+      segmentsUpdated: 0,
+      nearestStopName: null,
+      nearestDistanceM: null,
+      insideStopName: null,
+      insideState: 'OUTSIDE',
+      expectedNextStopName: null,
+    };
+    if (!point.isFiltered) {
+      detection = await runStopDetection(session.tripId, stops, point);
+    }
+
+    mutableSession.lastFix = {
+      timestampMs: point.timestampMs,
+      lat: point.lat,
+      lon: point.lon,
+      accuracyM: point.accuracyM,
+      speedMps: point.speedMps,
+      smoothedLat: point.smoothedLat,
+      smoothedLon: point.smoothedLon,
+      smoothedSpeedMps: point.smoothedSpeedMps,
+    };
+
+    try {
+      await flushPointBuffer();
+    } catch {
+      // already audit-logged inside flushPointBuffer
+    }
+    await saveActiveTripSession(mutableSession);
+
+    if (tripUpdateListener) {
+      tripUpdateListener({
+        type: 'point-update',
+        tripId: session.tripId,
+        pointsInserted: 1,
+        eventsInserted: detection.eventsInserted,
+        segmentUpdates: detection.segmentsUpdated,
+        lastFix: {
+          timestampMs: point.timestampMs,
+          lat: point.lat,
+          lon: point.lon,
+          accuracyM: point.accuracyM,
+          speedMps: point.speedMps,
+          headingDeg: point.headingDeg,
+        },
+        nearestStopName: detection.nearestStopName,
+        nearestStopDistanceM: detection.nearestDistanceM,
+        insideStopName: detection.insideStopName,
+        insideState: detection.insideState,
+        lastFilterReason: point.filterReason,
+        expectedNextStopName: detection.expectedNextStopName,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    await appendAuditLog({
+      scope: 'rnbg',
+      action: 'location-handler-exception',
+      trip_id: session?.tripId ?? null,
+      message,
+    });
+    if (tripUpdateListener) {
+      tripUpdateListener({
+        type: 'task-error',
+        tripId: session?.tripId ?? null,
+        message,
+        ts: Date.now(),
+      });
+    }
+  }
+}
+
+function handleLocationError(code: number): void {
+  // LocationError in RNBG v5 is a numeric code (not an object)
+  void appendAuditLog({
+    scope: 'rnbg',
+    action: 'location-error',
+    code,
+  });
+  if (tripUpdateListener) {
+    void loadActiveTripSession().then((session) => {
+      tripUpdateListener?.({
+        type: 'task-error',
+        tripId: session?.tripId ?? null,
+        message: `GPS error code ${code}`,
+        ts: Date.now(),
+      });
+    });
+  }
+}
+
+async function handleHeartbeat(): Promise<void> {
+  const session = await loadActiveTripSession();
+  if (!session) return;
+  await appendAuditLog({
+    scope: 'rnbg',
+    action: 'heartbeat',
+    trip_id: session.tripId,
   });
 }
+
+// ---------------------------------------------------------------------------
+// DB helpers
+// ---------------------------------------------------------------------------
 
 async function incrementTripRestartCount(tripId: string): Promise<void> {
   const db = await getDb();
@@ -403,15 +359,17 @@ async function incrementTripRestartCount(tripId: string): Promise<void> {
   );
 }
 
-async function insertGPSPoint(tripId: string, location: Location.LocationObject): Promise<InsertedGpsPoint> {
+async function insertGPSPoint(tripId: string, location: BGLocation, timestampMs: number): Promise<InsertedGpsPoint> {
   const db = await getDb();
   const coords = location.coords;
-  const timestampMs = location.timestamp;
   const lat = coords.latitude;
   const lon = coords.longitude;
-  const accuracyM = coords.accuracy ?? null;
-  const speedMps = coords.speed != null && Number.isFinite(coords.speed) && coords.speed >= 0 ? coords.speed : null;
-  const headingDeg = coords.heading != null && Number.isFinite(coords.heading) && coords.heading >= 0 ? coords.heading : null;
+  // RNBG uses -1 for unknown; convert to null for DB nullability consistency
+  const accuracyM = coords.accuracy >= 0 ? coords.accuracy : null;
+  const speedMps =
+    coords.speed != null && Number.isFinite(coords.speed) && coords.speed >= 0 ? coords.speed : null;
+  const headingDeg =
+    coords.heading != null && Number.isFinite(coords.heading) && coords.heading >= 0 ? coords.heading : null;
 
   const previousPoint = await db.getFirstAsync<StoredGpsPoint>(
     `SELECT timestamp_ms, lat, lon, accuracy_m, speed_mps, heading_deg, is_filtered, smoothed_lat, smoothed_lon, smoothed_speed_mps
@@ -447,21 +405,12 @@ async function insertGPSPoint(tripId: string, location: Location.LocationObject)
   } else if (previousPoint && timestampMs - previousPoint.timestamp_ms > GAP_RESET_MS) {
     // Gap check must come before cold_start so that the first point after a
     // CPU-sleep blackout is tagged post-gap-reset (not cold_start_zero_values).
-    // This resets the EMA to the recovery position and allows the next valid
-    // point to compute derived_speed_mps from the correct baseline.
     isFiltered = true;
     filterReason = 'post-gap-reset';
   } else if (
     speedMps === 0 &&
     headingDeg === 0 &&
     (
-      // Only treat speed=0+heading=0 as a "cold start" garbage fix when:
-      //   (a) accuracy is suspicious — provider hasn't locked yet
-      //   (b) the previous point was itself filtered (post-gap recovery context)
-      // Otherwise it is most likely a legitimate stationary fix (red light,
-      // bus dwelling at a stop), and we MUST keep it for arrive/dwell detection.
-      // Previous version filtered ANY 0/0 point, which silently dropped almost
-      // every stop dwell sample and corrupted segment stats.
       (accuracyM != null && accuracyM > 20) ||
       (previousPoint != null && previousPoint.is_filtered === 1)
     )
@@ -474,9 +423,6 @@ async function insertGPSPoint(tripId: string, location: Location.LocationObject)
   } else if (previousValidPoint) {
     const prevLon = previousValidPoint.lon ?? lon;
     const dtSec = (timestampMs - previousValidPoint.timestamp_ms) / 1000;
-    // Only compute derived fields when the time delta is plausible.
-    // A delta >= GAP_RESET_MS means the previousValidPoint is from before a
-    // blackout; the resulting near-zero speed would corrupt quality metrics.
     if (dtSec > 0 && dtSec < GAP_RESET_MS / 1000) {
       derivedSpeedMps = haversineMeters(previousValidPoint.lat, prevLon, lat, lon) / dtSec;
       derivedHeadingDeg = deriveHeadingDeg({ lat: previousValidPoint.lat, lon: prevLon }, { lat, lon });
@@ -574,9 +520,8 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
   const nearest = getNearestStop(stops, point.smoothedLat, point.smoothedLon);
   let target = await getTargetStop(tripId, stops);
 
-  // Skip-stop: if the bus is within SENSING_CONFIG.departureRadiusM of a stop that is ahead of the
-  // current target, the bus has passed the target without stopping. Mark the target
-  // as EXITED (skipped) and advance. Repeats if multiple stops were skipped.
+  // Skip-stop: if the bus is within departureRadiusM of a stop that is ahead of the
+  // current target, the bus has passed the target without stopping.
   if (target && nearest.stop && nearest.distanceM != null &&
       nearest.stop.stopOrder > target.stopOrder &&
       nearest.distanceM <= SENSING_CONFIG.departureRadiusM) {

@@ -1,7 +1,6 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Battery from 'expo-battery';
 import * as Location from 'expo-location';
-import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { AppState, type AppStateStatus } from 'react-native';
 
 import { getDb, isDbInitialized } from '../database/db';
@@ -17,7 +16,9 @@ import type { ActiveTripSession } from './activeTripStore';
 import { clearActiveTripSession, loadActiveTripSession, saveActiveTripSession } from './activeTripStore';
 import {
   ensureBackgroundLocationReady,
+  initBackgroundGeolocation,
   isBackgroundTrackingRunning,
+  registerRNBGHeadlessTask,
   setTripUpdateListener,
   startBackgroundTracking,
   restartBackgroundTracking,
@@ -295,28 +296,19 @@ class TripController {
       await this.verifyBatteryWhitelist();
       await ensureBackgroundLocationReady();
       await startBackgroundTracking();
+      // RNBG's native foreground service acquires its own PARTIAL_WAKE_LOCK —
+      // we no longer need expo-keep-awake for the bg-degraded experiment comparison.
       this.setState({
         foregroundServiceActive: SENSING_CONFIG.useForegroundService,
+        // wakeLockHeld tracks RNBG's internal lock (true when FG service is active)
+        wakeLockHeld: SENSING_CONFIG.useForegroundService,
         foregroundPermissionGranted: true,
         backgroundPermissionGranted: true,
         locationServicesEnabled: true,
         backgroundPermissionRevoked: false,
       });
-
-      // Acquire a trip-scoped PARTIAL_WAKE_LOCK so the CPU stays alive for the
-      // entire recording session. Gated so the bg-degraded variant (no foreground
-      // service) remains deliberately unprotected for the experiment comparison.
       if (SENSING_CONFIG.useForegroundService) {
-        try {
-          await activateKeepAwakeAsync('r503-active-trip');
-          this.setState({ wakeLockHeld: true });
-          this.appendLog('[WAKELOCK] Acquired');
-        } catch {
-          this.setState({ wakeLockHeld: false });
-          // best-effort; foreground service still runs without it
-        }
-      } else {
-        this.setState({ wakeLockHeld: false });
+        this.appendLog('[WAKELOCK] RNBG native wake lock acquired via foreground service');
       }
 
       // Start watchdog (variant-tuned), notification updater, battery sampler
@@ -410,14 +402,8 @@ class TripController {
 
     try {
       await stopBackgroundTracking();
-      this.setState({ foregroundServiceActive: false });
-      try {
-        deactivateKeepAwake('r503-active-trip');
-        this.setState({ wakeLockHeld: false });
-        this.appendLog('[WAKELOCK] Released');
-      } catch {
-        // best-effort
-      }
+      this.setState({ foregroundServiceActive: false, wakeLockHeld: false });
+      this.appendLog('[WAKELOCK] RNBG native wake lock released with foreground service');
       await flushPointBuffer();
       this.stopNotificationUpdater();
       this.stopBatterySampler();
@@ -614,6 +600,10 @@ class TripController {
   }
 
   private async bootstrap(): Promise<void> {
+    // Register RNBG headless task before DB init so the native service can
+    // deliver locations even if the JS process was restarted from scratch.
+    registerRNBGHeadlessTask();
+
     try {
       await getDb();
       this.setState({ dbReady: true });
@@ -646,6 +636,15 @@ class TripController {
 
     await this.refreshSystemStatus();
     this.startSystemStatusTimer();
+
+    // Init RNBG plugin — configures native service, attaches onLocation listener.
+    // Must run after DB is ready and before recoverActiveTrip starts tracking.
+    try {
+      await initBackgroundGeolocation();
+    } catch (error) {
+      this.appendLog(`RNBG init warning: ${getErrorMessage(error)}`);
+    }
+
     await this.recoverActiveTrip();
 
     // Register out-of-process watchdog so the OS can revive GPS even if our
@@ -701,17 +700,13 @@ class TripController {
       } else {
         this.appendLog('Recovered active trip after app restart.');
       }
-      this.setState({ foregroundServiceActive: SENSING_CONFIG.useForegroundService });
-      // Re-acquire wake lock if the variant uses it (process may have been
-      // recycled so the lock was lost).
+      this.setState({
+        foregroundServiceActive: SENSING_CONFIG.useForegroundService,
+        // RNBG's native service holds its own wake lock; mirror that state here.
+        wakeLockHeld: SENSING_CONFIG.useForegroundService,
+      });
       if (SENSING_CONFIG.useForegroundService) {
-        try {
-          await activateKeepAwakeAsync('r503-active-trip');
-          this.setState({ wakeLockHeld: true });
-          this.appendLog('[WAKELOCK] Re-acquired after recovery');
-        } catch {
-          // best-effort
-        }
+        this.appendLog('[WAKELOCK] RNBG native wake lock held via recovered foreground service');
       }
       this.startWatchdog(session.tripId);
       this.startNotificationUpdater();
@@ -808,6 +803,7 @@ class TripController {
         });
         await this.safeBackgroundCleanup();
         this.setState({ foregroundServiceActive: false, wakeLockHeld: false });
+
       }
     } else if (this.state.backgroundPermissionRevoked && this.state.backgroundPermissionGranted) {
       // User re-granted — clear the banner.
@@ -1163,11 +1159,6 @@ class TripController {
       await clearActiveTripSession();
     } catch {
       // Best effort.
-    }
-    try {
-      deactivateKeepAwake('r503-active-trip');
-    } catch {
-      // Best effort — safe to call even if no lock was acquired.
     }
     this.stopHealthTimer();
     this.stopWatchdog();

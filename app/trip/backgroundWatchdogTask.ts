@@ -1,13 +1,10 @@
 import * as BackgroundFetch from 'expo-background-fetch';
-import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
-import { activateKeepAwakeAsync } from 'expo-keep-awake';
-import { AppState } from 'react-native';
+import BackgroundGeolocation from 'react-native-background-geolocation';
 
 import { getDb, waitForDbInitialized } from '../database/db';
 import { appendAuditLog } from '../src/services/location/fileAudit';
 import { SENSING_CONFIG } from '../src/utils/experimentConfig';
-import { R503_BACKGROUND_TASK } from './backgroundLocationTask';
 import { loadActiveTripSession } from './activeTripStore';
 
 export const R503_BACKGROUND_WATCHDOG_TASK = 'R503_BACKGROUND_WATCHDOG_TASK';
@@ -46,68 +43,28 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_WATCHDOG_TASK)) {
       );
       const lastMs = lastRow?.timestamp_ms ?? null;
       const ageMs = lastMs != null ? Date.now() - lastMs : Date.now() - session.startedAtMs;
-      const gapThresholdMs = Math.max(
-        90_000,
-        SENSING_CONFIG.samplingIntervalMs * 60,
-      );
+      const gapThresholdMs = Math.max(90_000, SENSING_CONFIG.samplingIntervalMs * 60);
 
       if (ageMs < gapThresholdMs) {
         return BackgroundFetch.BackgroundFetchResult.NoData;
       }
 
-      const running = await Location.hasStartedLocationUpdatesAsync(R503_BACKGROUND_TASK);
-      try {
-        await activateKeepAwakeAsync('r503-gps');
-      } catch {
-        // best-effort
-      }
+      // With RNBG, start() is idempotent — safe to call even if already running.
+      // RNBG's START_STICKY service restarts itself natively; this is a belt-and-
+      // suspenders nudge from the out-of-process watchdog.
+      const rnbgState = await BackgroundGeolocation.getState();
 
-      // If the task registration is still alive, do nothing destructive —
-      // the OS will continue delivering callbacks. We do NOT call stop here
-      // because we cannot restart a foreground service from the background.
-      if (running) {
+      if (rnbgState.enabled) {
         await appendAuditLog({
           scope: 'background-watchdog',
-          action: 'reacquired-wakelock',
+          action: 'rnbg-already-running',
           trip_id: session.tripId,
           age_ms: ageMs,
         });
         return BackgroundFetch.BackgroundFetchResult.NewData;
       }
 
-      // Task registration is gone. Foreground service restart only works
-      // while the app is foregrounded (Android 12+ restriction). If we're
-      // backgrounded, log the gap and wait for the user to open the app —
-      // attempting startLocationUpdatesAsync here will throw
-      // ForegroundServiceStartNotAllowedException and waste a wake-up slot.
-      const appForeground = AppState.currentState === 'active';
-      if (!appForeground && SENSING_CONFIG.useForegroundService) {
-        await appendAuditLog({
-          scope: 'background-watchdog',
-          action: 'restart-skipped',
-          trip_id: session.tripId,
-          reason: 'app-backgrounded-fg-service-restricted',
-          age_ms: ageMs,
-        });
-        return BackgroundFetch.BackgroundFetchResult.NoData;
-      }
-
-      await Location.startLocationUpdatesAsync(R503_BACKGROUND_TASK, {
-        accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: SENSING_CONFIG.samplingIntervalMs,
-        distanceInterval: 0,
-        pausesUpdatesAutomatically: false,
-        showsBackgroundLocationIndicator: true,
-        ...(SENSING_CONFIG.useForegroundService
-          ? {
-              foregroundService: {
-                notificationTitle: 'R503 Logger',
-                notificationBody: 'Recovering GPS tracking',
-                killServiceOnDestroy: false,
-              } as Location.LocationTaskServiceOptions,
-            }
-          : {}),
-      });
+      await BackgroundGeolocation.start();
 
       await db.runAsync(
         `UPDATE trip_sessions
@@ -118,7 +75,7 @@ if (!TaskManager.isTaskDefined(R503_BACKGROUND_WATCHDOG_TASK)) {
 
       await appendAuditLog({
         scope: 'background-watchdog',
-        action: 'resubscribed',
+        action: 'rnbg-restarted',
         trip_id: session.tripId,
         age_ms: ageMs,
         threshold_ms: gapThresholdMs,
