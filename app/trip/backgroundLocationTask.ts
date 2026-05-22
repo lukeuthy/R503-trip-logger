@@ -510,138 +510,145 @@ async function runStopDetection(tripId: string, stops: RouteStop[], point: Inser
   }
 
   const nearest = getNearestStop(stops, point.smoothedLat, point.smoothedLon);
-  let target = await getTargetStop(tripId, stops);
+  const db = await getDb();
+  let eventsInserted = 0;
+  let segmentsUpdated = 0;
 
-  // Skip-stop: if the bus is within departureRadiusM of a stop that is ahead of the
-  // current target, the bus has passed the target without stopping.
-  if (target && nearest.stop && nearest.distanceM != null &&
-      nearest.stop.stopOrder > target.stopOrder &&
-      nearest.distanceM <= SENSING_CONFIG.departureRadiusM) {
-    const db = await getDb();
-    const targetState = await loadStopState(tripId, target.stopId);
-    if (targetState.state !== 'ARRIVED' && targetState.state !== 'DWELLING') {
+  // Find whichever stop is currently being visited (ARRIVED or DWELLING state).
+  // This query is direction-agnostic: we track the bus's actual location, not a
+  // predicted sequence. Post-processing determines traversal direction and count.
+  const activeRow = await db.getFirstAsync<{
+    stop_id: string;
+    state: string;
+    entered_at_ms: number | null;
+    dwell_at_ms: number | null;
+    exit_candidate_count: number;
+  }>(
+    `SELECT stop_id, state, entered_at_ms, dwell_at_ms, exit_candidate_count
+     FROM stop_states
+     WHERE trip_id = ? AND state IN ('ARRIVED', 'DWELLING')
+     LIMIT 1;`,
+    [tripId],
+  );
+
+  if (activeRow) {
+    const activeStop = stops.find((s) => s.stopId === activeRow.stop_id) ?? null;
+    if (activeStop) {
+      const distM = haversineMeters(point.smoothedLat, point.smoothedLon, activeStop.lat, activeStop.lng);
+      let nextState = activeRow.state as StopStateRow['state'];
+      let enteredAtMs = activeRow.entered_at_ms;
+      let dwellAtMs = activeRow.dwell_at_ms;
+      let exitCandidateCount = activeRow.exit_candidate_count ?? 0;
+
+      if (distM <= SENSING_CONFIG.geofenceRadiusM) {
+        exitCandidateCount = 0;
+        if (
+          nextState === 'ARRIVED' &&
+          enteredAtMs != null &&
+          point.timestampMs - enteredAtMs >= SENSING_CONFIG.dwellTimeMs
+        ) {
+          nextState = 'DWELLING';
+          dwellAtMs = point.timestampMs;
+          if (await insertStopEvent(tripId, activeStop, 'dwell', point, distM)) {
+            eventsInserted += 1;
+          }
+        }
+      } else if (distM >= SENSING_CONFIG.departureRadiusM) {
+        exitCandidateCount += 1;
+        if (exitCandidateCount >= EXIT_CONSECUTIVE_POINTS) {
+          nextState = 'EXITED';
+          if (await insertStopEvent(tripId, activeStop, 'exit', point, distM)) {
+            eventsInserted += 1;
+            await rebuildSegmentsForTrip(tripId);
+            segmentsUpdated += 1;
+          }
+        }
+      } else {
+        exitCandidateCount = 0;
+      }
+
       await db.runAsync(
         `INSERT INTO stop_states (trip_id, stop_id, state, entered_at_ms, dwell_at_ms, exit_candidate_count, updated_at_ms)
-         VALUES (?, ?, 'EXITED', NULL, NULL, 0, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(trip_id, stop_id) DO UPDATE SET
-           state = 'EXITED', updated_at_ms = excluded.updated_at_ms;`,
-        [tripId, target.stopId, point.timestampMs],
+           state = excluded.state,
+           entered_at_ms = excluded.entered_at_ms,
+           dwell_at_ms = excluded.dwell_at_ms,
+           exit_candidate_count = excluded.exit_candidate_count,
+           updated_at_ms = excluded.updated_at_ms;`,
+        [tripId, activeStop.stopId, nextState, enteredAtMs, dwellAtMs, exitCandidateCount, point.timestampMs],
       );
-      await appendAuditLog({
-        scope: 'stop-detection',
-        action: 'skip-stop-advanced',
-        trip_id: tripId,
-        stop_id: target.stopId,
-        ts: point.timestampMs,
-        message: `Skipped ${target.name}; nearest is ${nearest.stop.name} (order ${nearest.stop.stopOrder} > ${target.stopOrder})`,
-      });
-      target = await getTargetStop(tripId, stops);
+
+      return {
+        eventsInserted,
+        segmentsUpdated,
+        nearestStopName: nearest.stop?.name ?? null,
+        nearestDistanceM: nearest.distanceM,
+        insideStopName: distM <= SENSING_CONFIG.geofenceRadiusM ? activeStop.name : null,
+        insideState: distM <= SENSING_CONFIG.geofenceRadiusM ? 'INSIDE' : 'OUTSIDE',
+        expectedNextStopName: null,
+      };
     }
   }
 
-  if (!target) {
-    return {
-      eventsInserted: 0,
-      segmentsUpdated: 0,
-      nearestStopName: nearest.stop?.name ?? null,
-      nearestDistanceM: nearest.distanceM,
-      insideStopName: null,
-      insideState: 'OUTSIDE',
-      expectedNextStopName: null,
-    };
-  }
-
-  const db = await getDb();
-  const distM = haversineMeters(point.smoothedLat, point.smoothedLon, target.lat, target.lng);
-  const state = await loadStopState(tripId, target.stopId);
-  let eventsInserted = 0;
-  let segmentsUpdated = 0;
-  let nextState = state.state;
-  let enteredAtMs = state.entered_at_ms;
-  let dwellAtMs = state.dwell_at_ms;
-  let exitCandidateCount = state.exit_candidate_count ?? 0;
-
-  if ((state.state === 'OUTSIDE' || state.state === 'NEAR') && distM <= SENSING_CONFIG.geofenceRadiusM) {
-    nextState = 'ARRIVED';
-    enteredAtMs = point.timestampMs;
-    exitCandidateCount = 0;
-    if (await insertStopEventIfAllowed(tripId, target, 'arrive', point, distM)) {
+  // No active stop — check if the bus has entered any stop's geofence.
+  // Allows re-entry of previously visited (EXITED) stops on return legs.
+  if (nearest.stop && nearest.distanceM != null && nearest.distanceM <= SENSING_CONFIG.geofenceRadiusM) {
+    await db.runAsync(
+      `INSERT INTO stop_states (trip_id, stop_id, state, entered_at_ms, dwell_at_ms, exit_candidate_count, updated_at_ms)
+       VALUES (?, ?, 'ARRIVED', ?, NULL, 0, ?)
+       ON CONFLICT(trip_id, stop_id) DO UPDATE SET
+         state = 'ARRIVED',
+         entered_at_ms = excluded.entered_at_ms,
+         dwell_at_ms = NULL,
+         exit_candidate_count = 0,
+         updated_at_ms = excluded.updated_at_ms;`,
+      [tripId, nearest.stop.stopId, point.timestampMs, point.timestampMs],
+    );
+    if (await insertStopEvent(tripId, nearest.stop, 'arrive', point, nearest.distanceM)) {
       eventsInserted += 1;
       await rebuildSegmentsForTrip(tripId);
       segmentsUpdated += 1;
     }
-  } else if (state.state === 'ARRIVED' || state.state === 'DWELLING') {
-    if (distM <= SENSING_CONFIG.geofenceRadiusM) {
-      exitCandidateCount = 0;
-      if (state.state === 'ARRIVED' && enteredAtMs != null && point.timestampMs - enteredAtMs >= SENSING_CONFIG.dwellTimeMs) {
-        nextState = 'DWELLING';
-        dwellAtMs = point.timestampMs;
-        if (await insertStopEventIfAllowed(tripId, target, 'dwell', point, distM)) {
-          eventsInserted += 1;
-        }
-      }
-    } else if (distM >= SENSING_CONFIG.departureRadiusM) {
-      exitCandidateCount += 1;
-      if (exitCandidateCount >= EXIT_CONSECUTIVE_POINTS) {
-        nextState = 'EXITED';
-        if (await insertStopEventIfAllowed(tripId, target, 'exit', point, distM)) {
-          eventsInserted += 1;
-          await rebuildSegmentsForTrip(tripId);
-          segmentsUpdated += 1;
-        }
-      }
-    } else {
-      exitCandidateCount = 0;
-    }
+    return {
+      eventsInserted,
+      segmentsUpdated,
+      nearestStopName: nearest.stop.name,
+      nearestDistanceM: nearest.distanceM,
+      insideStopName: nearest.stop.name,
+      insideState: 'INSIDE',
+      expectedNextStopName: null,
+    };
   }
 
-  await db.runAsync(
-    `INSERT INTO stop_states (trip_id, stop_id, state, entered_at_ms, dwell_at_ms, exit_candidate_count, updated_at_ms)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(trip_id, stop_id) DO UPDATE SET
-       state = excluded.state,
-       entered_at_ms = excluded.entered_at_ms,
-       dwell_at_ms = excluded.dwell_at_ms,
-       exit_candidate_count = excluded.exit_candidate_count,
-       updated_at_ms = excluded.updated_at_ms;`,
-    [tripId, target.stopId, nextState, enteredAtMs, dwellAtMs, exitCandidateCount, point.timestampMs],
-  );
-
   return {
-    eventsInserted,
-    segmentsUpdated,
+    eventsInserted: 0,
+    segmentsUpdated: 0,
     nearestStopName: nearest.stop?.name ?? null,
     nearestDistanceM: nearest.distanceM,
-    insideStopName: distM <= SENSING_CONFIG.geofenceRadiusM ? target.name : null,
-    insideState: distM <= SENSING_CONFIG.geofenceRadiusM ? 'INSIDE' : 'OUTSIDE',
-    expectedNextStopName: target.name,
+    insideStopName: null,
+    insideState: 'OUTSIDE',
+    expectedNextStopName: null,
   };
 }
 
-async function insertStopEventIfAllowed(
+async function insertStopEvent(
   tripId: string,
   stop: RouteStop,
   eventType: 'arrive' | 'dwell' | 'exit',
   point: InsertedGpsPoint,
   distM: number,
 ): Promise<boolean> {
-  const db = await getDb();
+  // For dwell/exit: require at least one prior arrive event (defensive; the state
+  // machine guarantees this but a DB query guards against edge-case data corruption).
+  // No per-visit dedup — multiple traversals produce multiple events intentionally.
   if (eventType !== 'arrive') {
+    const db = await getDb();
     const arrive = await db.getFirstAsync<{ count: number }>(
       'SELECT COUNT(*) as count FROM stop_events WHERE trip_id = ? AND stop_id = ? AND event_type = ?;',
       [tripId, stop.stopId, 'arrive'],
     );
     if ((arrive?.count ?? 0) === 0) {
-      return false;
-    }
-    // Dedupe: only one dwell/exit per (trip_id, stop_id). Guards against the race
-    // where two consecutive GPS points both pass the EXIT_CONSECUTIVE_POINTS threshold
-    // before the stop_state row is updated to 'EXITED'.
-    const existing = await db.getFirstAsync<{ count: number }>(
-      'SELECT COUNT(*) as count FROM stop_events WHERE trip_id = ? AND stop_id = ? AND event_type = ?;',
-      [tripId, stop.stopId, eventType],
-    );
-    if ((existing?.count ?? 0) > 0) {
       return false;
     }
   }
@@ -659,32 +666,6 @@ async function insertStopEventIfAllowed(
     dwellSpeedConfirmed:
       eventType === 'dwell' && point.speedMps != null ? point.speedMps < 1.4 : undefined,
   });
-}
-
-async function getTargetStop(tripId: string, stops: RouteStop[]): Promise<RouteStop | null> {
-  const db = await getDb();
-  const rows = await db.getAllAsync<{ stop_id: string; state: string }>(
-    'SELECT stop_id, state FROM stop_states WHERE trip_id = ?;',
-    [tripId],
-  );
-  const statesByStopId = new Map(rows.map((row) => [row.stop_id, row.state]));
-  const active = stops.find((stop) => {
-    const state = statesByStopId.get(stop.stopId);
-    return state === 'ARRIVED' || state === 'DWELLING' || state === 'NEAR';
-  });
-  if (active) {
-    return active;
-  }
-  return stops.find((stop) => statesByStopId.get(stop.stopId) !== 'EXITED') ?? null;
-}
-
-async function loadStopState(tripId: string, stopId: string): Promise<StopStateRow> {
-  const db = await getDb();
-  const row = await db.getFirstAsync<StopStateRow>(
-    'SELECT state, entered_at_ms, dwell_at_ms, exit_candidate_count FROM stop_states WHERE trip_id = ? AND stop_id = ?;',
-    [tripId, stopId],
-  );
-  return row ?? { state: 'OUTSIDE', entered_at_ms: null, dwell_at_ms: null, exit_candidate_count: 0 };
 }
 
 function getNearestStop(
