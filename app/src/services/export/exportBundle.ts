@@ -39,7 +39,10 @@ export async function exportTripBundle(tripId: string): Promise<ExportBundleResu
     [canonicalTripId],
   );
   const stops = await db.getAllAsync<Record<string, unknown>>(
-    'SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code FROM stop ORDER BY stop_sequence ASC;',
+    `SELECT stop_id, variant_id, stop_order, name, lat, lng, radius_m
+     FROM stops
+     WHERE variant_id = 'r503_am'
+     ORDER BY stop_order ASC;`,
   );
   const batterySamples = await db.getAllAsync<Record<string, unknown>>(
     'SELECT id, trip_id, timestamp_ms, level_pct FROM battery_samples WHERE trip_id = ? ORDER BY timestamp_ms ASC;',

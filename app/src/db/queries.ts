@@ -78,14 +78,11 @@ export async function ensureDeviceRegistered(): Promise<string> {
   return deviceId;
 }
 
-export function resolveVariantId(directionCode: DirectionCode, _windowCode: WindowCode): string {
-  // The stops table is keyed by direction (all R503 stops are seeded with
-  // direction_code='A' → 'r503_am'). The window_code (AM/PM/OFF) is a TIME
-  // bucket metadata and must NOT change which stop set we look up against.
-  // Previously this returned 'r503_pm' for any PM trip, which produced zero
-  // stop_events because no stops exist under r503_pm (direction-B stops
-  // haven't been seeded). time_bucket already preserves the window code.
-  return directionCode === 'B' ? 'r503_pm' : 'r503_am';
+export function resolveVariantId(_directionCode: DirectionCode, _windowCode: WindowCode): string {
+  // All R503 stops — outbound and return legs — are seeded into r503_am as a
+  // single 24-stop loop. Direction is not a routing concept in this app;
+  // all trips use the same stop set regardless of time of day or leg.
+  return 'r503_am';
 }
 
 export function computeTimeBucket(timestampMs: number): string {

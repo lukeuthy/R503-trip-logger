@@ -27,7 +27,7 @@ import {
 } from './backgroundLocationTask';
 import { registerBackgroundWatchdog } from './backgroundWatchdogTask';
 import { clearTripNotification, publishTripNotification } from './tripNotification';
-import { createInitialStopDetectorState, getStopDetectionConfig, type StopInfo } from './stopDetector';
+import { createInitialStopDetectorState, getStopDetectionConfig } from './stopDetector';
 import {
   type DanglingTripRecovery,
   finalizeDanglingTrips,
@@ -62,7 +62,6 @@ export interface UITripState {
   status: 'idle' | 'recording' | 'stopped';
   isBusy: boolean;
   routeNumber: 'R503';
-  directionCode: DirectionCode;
   windowCode: WindowCode;
   tripId: string | null;
   pointsCount: number;
@@ -128,7 +127,6 @@ class TripController {
     status: 'idle',
     isBusy: false,
     routeNumber: 'R503',
-    directionCode: 'A',
     windowCode: 'OFF',
     tripId: null,
     pointsCount: 0,
@@ -181,7 +179,6 @@ class TripController {
   };
 
   private listeners = new Set<(state: UITripState) => void>();
-  private stops: StopInfo[] = [];
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
   private healthTimer: ReturnType<typeof setInterval> | null = null;
   private batteryStartPct: number | null = null;
@@ -224,13 +221,6 @@ class TripController {
     this.setState({ chartsMode });
   }
 
-  setDirectionCode(directionCode: DirectionCode): void {
-    if (this.state.status === 'recording') {
-      return;
-    }
-    this.setState({ directionCode });
-  }
-
   setWindowCode(windowCode: WindowCode): void {
     if (this.state.status === 'recording') {
       return;
@@ -263,16 +253,15 @@ class TripController {
       const tripId = createUuidV4();
       tripIdForRollback = tripId;
 
-      this.stops = await this.loadStops(this.state.directionCode);
       await db.runAsync(
         `INSERT INTO trip (trip_id, started_at_ms, ended_at_ms, route_number, direction_code, window_code, status)
          VALUES (?, ?, NULL, ?, ?, ?, ?);`,
-        [tripId, startedAtMs, this.state.routeNumber, this.state.directionCode, this.state.windowCode, 'recording'],
+        [tripId, startedAtMs, this.state.routeNumber, 'A', this.state.windowCode, 'recording'],
       );
 
       await insertSessionMetadata({
         tripId,
-        directionCode: this.state.directionCode,
+        directionCode: 'A',
         windowCode: this.state.windowCode,
         appVersion: APP_VERSION,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -293,10 +282,10 @@ class TripController {
       const session: ActiveTripSession = {
         tripId,
         routeNumber: 'R503',
-        directionCode: this.state.directionCode,
+        directionCode: 'A',
         windowCode: this.state.windowCode,
         startedAtMs,
-        variantId: resolveVariantId(this.state.directionCode, this.state.windowCode),
+        variantId: resolveVariantId('A', this.state.windowCode),
         detectorState: createInitialStopDetectorState(),
         v1StopState: createInitialStopDetectionState(),
         lastFix: null,
@@ -676,13 +665,11 @@ class TripController {
         return;
       }
 
-      this.stops = await this.loadStops(session.directionCode);
       const snapshot = await this.loadTripSnapshot(session.tripId);
 
       this.setState({
         status: 'recording',
         tripId: session.tripId,
-        directionCode: session.directionCode,
         windowCode: session.windowCode,
         startedAtMs: trip.started_at_ms,
         pointsCount: snapshot.pointsCount,
@@ -1073,23 +1060,6 @@ class TripController {
       lastFilterReason: update.lastFilterReason,
     });
     void this.refreshTrackingHealth();
-  }
-
-  private async loadStops(directionCode: DirectionCode): Promise<StopInfo[]> {
-    const db = await getDb();
-    const filtered = await db.getAllAsync<StopInfo>(
-      `SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code
-       FROM stop
-       WHERE direction_code = ?
-       ORDER BY stop_sequence ASC;`,
-      [directionCode],
-    );
-    if (filtered.length > 0) {
-      return filtered;
-    }
-    return db.getAllAsync<StopInfo>(
-      'SELECT stop_id, stop_name, lat, lon, stop_sequence, direction_code FROM stop ORDER BY stop_sequence ASC;',
-    );
   }
 
   private startElapsedTimer(): void {

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Pressable, SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
 
-import type { DirectionCode, WindowCode } from './models/Trip';
+import type { WindowCode } from './models/Trip';
 import { type UITripState, tripController } from './trip/TripController';
 
 function formatNumber(value: number | null, digits = 2): string {
@@ -59,10 +59,6 @@ export default function Explore() {
           <Text style={styles.sectionTitle}>Route</Text>
           <Text style={styles.valueStrong}>R503 (locked)</Text>
         </View>
-
-        {renderSelector<DirectionCode>('Direction', state.directionCode, ['A', 'B'], controlsLocked, (value) => {
-          tripController.setDirectionCode(value);
-        })}
 
         {renderSelector<WindowCode>('Service Window', state.windowCode, ['AM', 'PM', 'OFF'], controlsLocked, (value) => {
           tripController.setWindowCode(value);

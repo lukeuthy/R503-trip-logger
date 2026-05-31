@@ -224,7 +224,7 @@ async function seedLegacyStops(db: SQLite.SQLiteDatabase): Promise<void> {
     await db.runAsync(
       `INSERT INTO stop (stop_id, stop_name, lat, lon, stop_sequence, direction_code)
        VALUES (?, ?, ?, ?, ?, ?);`,
-      [stop.stop_id, stop.stop_name, stop.lat, stop.lon, stop.stop_sequence, stop.direction_code],
+      [stop.stop_id, stop.stop_name, stop.lat, stop.lon, stop.stop_sequence, 'A'],
     );
   }
 }
@@ -265,8 +265,8 @@ async function seedV1ReferenceData(db: SQLite.SQLiteDatabase): Promise<void> {
   });
 
   for (const stop of R503_STOPS) {
-    const variantId = stop.direction_code === 'A' ? 'r503_am' : 'r503_pm';
-    const stopId = `r503_${variantId}_s${String(stop.stop_sequence).padStart(2, '0')}`;
+    const variantId = 'r503_am';
+    const stopId = `r503_am_s${String(stop.stop_sequence).padStart(2, '0')}`;
     const existing = await db.getFirstAsync<{ count: number }>('SELECT COUNT(*) as count FROM stops WHERE stop_id = ?;', [
       stopId,
     ]);

@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
-import type { DirectionCode, WindowCode } from '../../models/Trip';
+import type { WindowCode } from '../../models/Trip';
 import { tripController, type UITripState } from '../../trip/TripController';
 import { GlassCard } from '../components/GlassCard';
 import { colors, spacing } from '../theme/tokens';
@@ -60,13 +60,6 @@ export function TripScreen() {
         />
       ) : null}
 
-      <Selector
-        label="Direction"
-        value={state.directionCode}
-        options={['A', 'B']}
-        disabled={state.status === 'recording' || state.isBusy}
-        onChange={(value) => tripController.setDirectionCode(value)}
-      />
       <Selector
         label="Service Window"
         value={state.windowCode}
